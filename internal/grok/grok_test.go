@@ -17,7 +17,8 @@ import (
 // Sanitized excerpts from session 01a0be48-8eca-7633-ba5c-f2f58d58a384,
 // inspected with grok 1.0.41 (4220f3b224a6) on 2026-09-27. Updates source
 // lines: 4,5,6,8,14,20,27,29,33,957,2027,7164,7890,14971,34313,34314.
-// Chat lines: 1,2,3,4,5,7,8. The checkpoint is the one referenced on line 2027.
+// The checkpoint is the one referenced on line 2027. The last line is the
+// /compact host-turn echo from a grok 1.0.41 headless session run 2026-09-27.
 // Text, paths and IDs are replaced; timestamps are renumbered and telemetry
 // omitted. Update/content shapes and relative ordering are preserved, including
 // promptIndex on real turns and both compaction_meta records around a retained
@@ -29,21 +30,18 @@ import (
 //go:embed testdata/updates.jsonl
 var acpLog string
 
-//go:embed testdata/chat_history.jsonl
-var chatLog string
-
 //go:embed testdata/checkpoint.json
 var checkpoint string
 
 const cwd = "/home/u/src/proj"
 
-func writeSession(t *testing.T, root, group, id string, summary map[string]any, chat, updates string, mod time.Time) string {
+func writeSession(t *testing.T, root, group, id string, summary map[string]any, updates string, mod time.Time) string {
 	t.Helper()
 	dir := filepath.Join(root, "sessions", group, id)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	files := map[string]string{chatFile: chat, updatesFile: updates}
+	files := map[string]string{updatesFile: updates}
 	if summary != nil {
 		b, err := json.Marshal(summary)
 		if err != nil {
@@ -70,59 +68,46 @@ func TestRead(t *testing.T) {
 	at := func(n int64) time.Time { return time.UnixMilli(n * 1000) }
 	// Literal expectations are independent of session.Failure and the parser.
 	updates := []session.Entry{
-		{Kind: "message", Role: "user", Text: "support grok", Time: at(1)},
+		{Kind: "message", Role: "user", Text: "support grok", Time: at(1), Retained: true},
 		{Kind: "message", Role: "assistant", Text: "I will read the log.", Time: at(3)},
 		{Kind: "failure", Role: "tool", Tool: "list_dir", Input: `{"target_directory":"redacted"}`, Text: `{"type":"ListDir","NotFound":"redacted"}`, Time: at(7)},
 		{Kind: "failure", Role: "tool", Tool: "read_file", Input: `{"target_file":"a.txt","limit":80}`, Text: "read failed", Time: at(8)},
 		{Kind: "failure", Role: "tool", Text: "background failed", Time: at(10)},
-		{Kind: "compact", Text: "injected context\nthe compaction summary", Time: at(11)},
+		{Kind: "compact", Text: "the compaction summary", Time: at(11)},
 		{Kind: "message", Role: "user", Text: "finish it", Time: at(13)},
 		{Kind: "stop", Reason: "error", Time: at(14)},
 		{Kind: "message", Role: "assistant", Text: "all done", Time: at(15)},
 	}
-	chat := []session.Entry{
-		{Kind: "compact", Text: "injected context"},
-		{Kind: "message", Role: "user", Text: "support grok", Retained: true},
-		{Kind: "compact", Text: "the compaction summary"},
-		{Kind: "message", Role: "assistant", Text: "I will read the log."},
-	}
-	loss := "without timestamps, tool failures, or stop reasons; pre-compaction history may be missing"
+	// A second compaction keeps only its own last user turn.
+	lines := strings.SplitAfter(acpLog, "\n")
+	again := slices.Clone(updates)
+	again[0].Retained, again[6].Retained = false, true
+	again = append(again, session.Entry{Kind: "compact", Text: "the compaction summary", Time: at(11)})
 	unknown := `{"params":{"update":{"sessionUpdate":"future_kind"}}}` + "\n"
+	// The pre-envelope line upstream still reads (storage/mod.rs tests).
+	legacy := `{"sessionId":"s","update":{"sessionUpdate":"user_message_chunk","content":{"type":"text","text":"legacy prompt"}}}`
 	for _, tc := range []struct {
-		name, updates, chat string
-		want                []session.Entry
-		warnings            []string
+		name, updates string
+		want          []session.Entry
+		warnings      []string
 	}{
-		{"updates", acpLog, chatLog, updates, nil},
-		{"string visibility", strings.Replace(acpLog, `"hideFromScrollback":true`, `"hideFromScrollback":"True"`, 1), "", updates, nil},
-		{"timestamp fallback", strings.Replace(acpLog, `"agentTimestampMs":1000`, `"unused":1000`, 1), "", updates, nil},
-		{"duplicate failure", acpLog + strings.Split(acpLog, "\n")[7] + "\n", "", updates, nil},
-		{"torn updates", acpLog + `{"params":`, "", updates, []string{"malformed record"}},
-		{"unknown update", acpLog + unknown, "", updates, []string{"future_kind"}},
-		{"missing updates", "", chatLog, chat, []string{"updates.jsonl is missing", loss}},
-		{"empty updates", "\n", chatLog, chat, []string{"no readable conversation", loss}},
-		{"malformed updates", `{"params":`, chatLog, chat, []string{"malformed record", loss}},
-		{"unknown only", unknown, chatLog, chat, []string{"future_kind", loss}},
-		{"oversized updates", acpLog, chatLog, chat, []string{"over the 512 MB limit", loss}},
-		{"oversized without fallback", acpLog, "", nil, []string{"over the 512 MB limit", loss}},
-		{"torn chat", "", chatLog + `{"type":`, chat, []string{"last record is incomplete", loss}},
-		{"unknown chat", "", chatLog + `{"type":"future_kind"}`, chat, []string{"future_kind", loss}},
-		{"no transcript", "", "", nil, nil},
-		{"malformed without fallback", `{"params":`, "", nil, []string{"malformed record"}},
+		{"updates", acpLog, updates, nil},
+		{"second compaction", acpLog + lines[10], again, nil},
+		{"timestamp fallback", strings.Replace(acpLog, `"agentTimestampMs":1000`, `"unused":1000`, 1), updates, nil},
+		{"duplicate failure", acpLog + lines[7], updates, nil},
+		{"torn updates", acpLog + `{"params":`, updates, []string{"malformed record"}},
+		{"unknown update", acpLog + unknown, updates, []string{"future_kind"}},
+		{"legacy envelope", legacy, []session.Entry{{Kind: "message", Role: "user", Text: "legacy prompt"}}, nil},
+		{"no transcript", "", nil, nil},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			dir := writeSession(t, t.TempDir(), "group", "id", nil, tc.chat, tc.updates, time.Now())
+			dir := writeSession(t, t.TempDir(), "group", "id", nil, tc.updates, time.Now())
 			cp := filepath.Join(dir, "compaction_checkpoints")
 			if err := os.Mkdir(cp, 0o755); err != nil {
 				t.Fatal(err)
 			}
 			if err := os.WriteFile(filepath.Join(cp, "cp1.json"), []byte(checkpoint), 0o644); err != nil {
 				t.Fatal(err)
-			}
-			if strings.HasPrefix(tc.name, "oversized") {
-				if err := os.Truncate(filepath.Join(dir, updatesFile), updatesMaxBytes+1); err != nil {
-					t.Fatal(err)
-				}
 			}
 			th, err := New().Read(context.Background(), session.Source{Path: dir})
 			if err != nil {
@@ -138,9 +123,6 @@ func TestRead(t *testing.T) {
 				if !strings.Contains(strings.Join(th.Warnings, "\n"), want) {
 					t.Errorf("warnings = %v, want %q", th.Warnings, want)
 				}
-			}
-			if len(th.Entries) > 0 && th.Entries[0].Kind == "compact" && th.Source.Metadata["model"] != "grok-build" {
-				t.Errorf("fallback model = %q", th.Source.Metadata["model"])
 			}
 		})
 	}
@@ -175,7 +157,7 @@ func TestListAndResolve(t *testing.T) {
 			"generated_title": tc.title, "session_summary": "longer summary",
 			"current_model_id": "grok-build", "last_active_at": tc.active.Format(time.RFC3339),
 		}
-		writeSession(t, root, tc.group, tc.id, summary, chatLog, acpLog, tc.mtime)
+		writeSession(t, root, tc.group, tc.id, summary, acpLog, tc.mtime)
 	}
 	p := New()
 	for _, tc := range []struct {
@@ -236,7 +218,7 @@ func TestVisibility(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			root := t.TempDir()
-			writeSession(t, root, "group", "id", tc.fields, chatLog, "", time.Now())
+			writeSession(t, root, "group", "id", tc.fields, acpLog, time.Now())
 			p, roots := New(), session.Roots{Grok: root}
 			rows, err := p.List(context.Background(), roots, session.ListOptions{})
 			if err != nil || (len(rows) == 1) != tc.listed {
@@ -257,17 +239,17 @@ func TestIndexFallbacks(t *testing.T) {
 	for _, tc := range []struct {
 		name, title string
 		summary     map[string]any
-		chat        string
+		updates     string
 		resolves    bool
 	}{
-		{"summary title", "summary", map[string]any{"session_summary": "summary", "updated_at": "1970-01-01T00:01:40Z"}, chatLog, true},
-		{"cwd title", "proj", map[string]any{"info": map[string]string{"cwd": cwd}, "num_messages": 1}, chatLog, true},
+		{"summary title", "summary", map[string]any{"session_summary": "summary", "updated_at": "1970-01-01T00:01:40Z"}, acpLog, true},
+		{"cwd title", "proj", map[string]any{"info": map[string]string{"cwd": cwd}, "num_messages": 1}, acpLog, true},
 		{"no transcript", "", map[string]any{"num_messages": 1}, "", true},
-		{"no summary", "", nil, chatLog, false},
+		{"no summary", "", nil, acpLog, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			root := t.TempDir()
-			writeSession(t, root, "slug-hash", "id", tc.summary, tc.chat, "", time.Unix(100, 0))
+			writeSession(t, root, "slug-hash", "id", tc.summary, tc.updates, time.Unix(100, 0))
 			p, roots := New(), session.Roots{Grok: root}
 			src, err := p.Resolve(context.Background(), roots, "id")
 			if (err == nil) != tc.resolves {
@@ -277,7 +259,7 @@ func TestIndexFallbacks(t *testing.T) {
 				t.Errorf("source = %+v", src)
 			}
 			rows, err := p.List(context.Background(), roots, session.ListOptions{})
-			if err != nil || (len(rows) == 1) != (tc.resolves && tc.chat != "") {
+			if err != nil || (len(rows) == 1) != (tc.resolves && tc.updates != "") {
 				t.Errorf("list = %+v, %v", rows, err)
 			}
 		})

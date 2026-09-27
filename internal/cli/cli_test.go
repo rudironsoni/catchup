@@ -148,7 +148,7 @@ func piAgentRoot(t *testing.T) session.Roots {
 
 // grokRoot writes one Grok session under a percent-encoded cwd group and
 // returns a Roots pointing at it. summary.json is the index entry; the
-// transcript is chat_history.jsonl.
+// transcript is updates.jsonl.
 func grokRoot(t *testing.T) session.Roots {
 	t.Helper()
 	root := t.TempDir()
@@ -157,30 +157,17 @@ func grokRoot(t *testing.T) session.Roots {
 		t.Fatal(err)
 	}
 	summary := `{"info":{"id":"gr-1","cwd":"/home/u/src/proj"},"generated_title":"grok session","last_active_at":"2026-07-18T15:20:00Z"}`
-	chat, err := os.ReadFile("../grok/testdata/chat_history.jsonl")
+	updates, err := os.ReadFile("../grok/testdata/updates.jsonl")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(filepath.Join(dir, "summary.json"), []byte(summary), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(dir, "chat_history.jsonl"), []byte(chat), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, "updates.jsonl"), updates, 0o644); err != nil {
 		t.Fatal(err)
 	}
 	return session.Roots{Grok: root}
-}
-
-func TestRunReadsGrokSession(t *testing.T) {
-	roots := grokRoot(t)
-	out := run(t, roots, "grok", "--id", "gr-1", "--since-compact")
-	for _, want := range []string{"agent: grok", "session: gr-1", "title: grok session", "support grok", "the compaction summary", "I will read the log."} {
-		if !strings.Contains(out, want) {
-			t.Errorf("grok read missing %q:\n%s", want, out)
-		}
-	}
-	if strings.Contains(out, "injected context") {
-		t.Error("--since-compact kept an obsolete compaction marker")
-	}
 }
 
 func runWithCwd(t *testing.T, roots session.Roots, cwd string, args ...string) string {

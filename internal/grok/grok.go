@@ -1,5 +1,5 @@
 // Package grok reads Grok Build history under $GROK_HOME (default ~/.grok):
-// sessions/<cwd-group>/<id>/{summary.json,updates.jsonl,chat_history.jsonl}.
+// sessions/<cwd-group>/<id>/{summary.json,updates.jsonl}.
 // IDs and cwd come from summary.json, not the percent-encoded or hashed group.
 //
 // Format evidence: real sessions inspected with grok 1.0.41 (4220f3b224a6),
@@ -10,17 +10,15 @@
 // Compatibility with other versions has not been established.
 //
 // updates.jsonl is the authoritative ACP timeline, preserving timestamps,
-// failures, stop reasons and history across compactions. Assistant chunks join
-// until a user turn, tool call or turn completion. hideFromScrollback excludes
-// injected user chunks; promptIndex alone does not. Unknown kinds warn, while
-// known reasoning/tooling/UI updates are explicitly ignored below.
+// failures, stop reasons and history across compactions; chat_history.jsonl is
+// a cache derived from it (upstream storage/mod.rs) and is not read. Assistant
+// chunks join until a user turn, tool call or turn completion.
+// hideFromScrollback excludes injected user chunks; promptIndex alone does not.
+// Unknown kinds warn, while known reasoning/tooling/UI updates are explicitly
+// ignored below.
 //
-// Each compaction_checkpoint references a file under compaction_checkpoints/;
-// all its compaction_meta records form the recap, including injected context
-// and the summary. chat_history.jsonl is the lossy fallback, not a second copy
-// of the timeline: compaction replaces it, losing older history. Surviving
-// messages before its final compaction marker are Retained. Fallback reads warn
-// about missing timestamps, failures, stops and possible lost history.
+// Each compaction_checkpoint references a file under compaction_checkpoints/
+// whose compaction_meta records, after the environment prefix, form the recap.
 // Hidden sessions and unused husks stay out of listings; --id still reads them.
 package grok
 
@@ -50,16 +48,7 @@ func New() *Provider { return &Provider{} }
 
 var _ session.Provider = (*Provider)(nil)
 
-const (
-	updatesFile = "updates.jsonl"
-	chatFile    = "chat_history.jsonl"
-)
-
-// updatesMaxBytes bounds the authoritative-transcript read. A very long
-// session's updates.jsonl can run to hundreds of MB (every streamed chunk and
-// hook run); past this the provider falls back to the smaller chat_history.jsonl
-// and says so, rather than streaming an unbounded file on every read.
-const updatesMaxBytes int64 = 512 << 20
+const updatesFile = "updates.jsonl"
 
 // scanLine bounds one updates.jsonl line.
 const scanLine = 64 << 20
@@ -85,37 +74,6 @@ func (p *Provider) Resolve(ctx context.Context, roots session.Roots, id string) 
 	return session.Source{}, fmt.Errorf("grok: no session with id %q", id)
 }
 
-// readThread builds a session's timeline from its authoritative source:
-// updates.jsonl when present and within updatesMaxBytes, else chat_history.jsonl.
-// stopAfterUser asks for the cheap preview read — stop once the first real user
-// turn is seen — which a plain listing uses; a full read, and a queried listing,
-// see the whole session.
-func readThread(src session.Source, stopAfterUser bool) (session.Thread, error) {
-	updates := filepath.Join(src.Path, updatesFile)
-	info, err := os.Stat(updates)
-	var warnings []string
-	reason := "updates.jsonl is missing"
-	switch {
-	case err != nil && !errors.Is(err, fs.ErrNotExist):
-		return session.Thread{}, err
-	case err == nil && info.Size() > updatesMaxBytes:
-		reason = fmt.Sprintf("updates.jsonl is over the %d MB limit", updatesMaxBytes>>20)
-	case err == nil:
-		t, err := readUpdates(src, updates, stopAfterUser)
-		if err != nil || len(t.Entries) > 0 {
-			return t, err
-		}
-		warnings = t.Warnings
-		reason = "updates.jsonl has no readable conversation"
-	}
-	t, err := readChat(src, filepath.Join(src.Path, chatFile))
-	t.Warnings = append(warnings, t.Warnings...)
-	if err == nil && (info != nil || len(t.Entries) > 0) {
-		t.Warnings = append(t.Warnings, reason+"; using chat_history.jsonl without timestamps, tool failures, or stop reasons; pre-compaction history may be missing")
-	}
-	return t, err
-}
-
 func (p *Provider) Read(ctx context.Context, src session.Source) (session.Thread, error) {
 	if src.Path == "" {
 		return session.Thread{}, errors.New("grok: source has no path")
@@ -127,7 +85,7 @@ func (p *Provider) Read(ctx context.Context, src session.Source) (session.Thread
 	if !info.IsDir() {
 		return session.Thread{}, errors.New("grok: source is not a session directory")
 	}
-	return readThread(src, false)
+	return readUpdates(src, false)
 }
 
 func (p *Provider) List(ctx context.Context, roots session.Roots, opts session.ListOptions) ([]session.Summary, error) {
@@ -151,7 +109,7 @@ func (p *Provider) List(ctx context.Context, roots session.Roots, opts session.L
 		// A query must see the whole session, exactly as a read does — a term
 		// that only exists before a compaction is still in updates.jsonl. A
 		// plain listing needs only a preview, so it stops at the first turn.
-		t, err := readThread(src, opts.Query == "")
+		t, err := readUpdates(src, opts.Query == "")
 		if err != nil || len(t.Entries) == 0 {
 			continue
 		}
@@ -321,9 +279,11 @@ func summaryTime(s grokSummary, summaryPath string) time.Time {
 
 // acpLine is one updates.jsonl record: a JSON-RPC notification whose params
 // carry the discriminated update (kept raw and decoded per kind below) and an
-// outer _meta with the millisecond wall-clock.
+// outer _meta with the millisecond wall-clock. Old sessions wrote the params
+// object bare, without the method/params envelope (upstream storage/mod.rs).
 type acpLine struct {
-	Timestamp int64 `json:"timestamp"`
+	Timestamp int64           `json:"timestamp"`
+	Update    json.RawMessage `json:"update"`
 	Params    struct {
 		Update json.RawMessage `json:"update"`
 		Meta   struct {
@@ -350,7 +310,8 @@ type contentObject struct {
 type acpUserChunk struct {
 	Content contentObject `json:"content"`
 	Meta    struct {
-		HideFromScrollback json.RawMessage `json:"hideFromScrollback"`
+		HideFromScrollback bool `json:"hideFromScrollback"`
+		HostTurn           bool `json:"hostTurn"`
 	} `json:"_meta"`
 }
 
@@ -410,10 +371,13 @@ var acpIgnored = map[string]bool{
 
 // readUpdates parses updates.jsonl into the visible timeline, carrying a
 // timestamp on every entry. stopAfterUser returns as soon as the first real user
-// turn is read, which is all a listing preview needs; a full read sees the whole
-// session.
-func readUpdates(src session.Source, path string, stopAfterUser bool) (session.Thread, error) {
-	f, err := os.Open(path)
+// turn is read, which is all a listing preview needs; a full read, and a queried
+// listing, see the whole session. A missing transcript is not an error.
+func readUpdates(src session.Source, stopAfterUser bool) (session.Thread, error) {
+	f, err := os.Open(filepath.Join(src.Path, updatesFile))
+	if errors.Is(err, fs.ErrNotExist) {
+		return session.Thread{Source: src}, nil
+	}
 	if err != nil {
 		return session.Thread{}, err
 	}
@@ -448,12 +412,15 @@ func readUpdates(src session.Source, path string, stopAfterUser bool) (session.T
 			warnings = append(warnings, session.ReadStopWarning(err))
 			break
 		}
+		raw := rec.Params.Update
+		if raw == nil {
+			raw = rec.Update
+		}
 		var kind acpKind
-		if json.Unmarshal(rec.Params.Update, &kind) != nil {
+		if json.Unmarshal(raw, &kind) != nil {
 			continue
 		}
 		ts := lineTime(rec.Params.Meta.AgentTimestampMs, rec.Timestamp)
-		raw := rec.Params.Update
 
 		switch kind.SessionUpdate {
 		case "user_message_chunk":
@@ -463,10 +430,11 @@ func readUpdates(src session.Source, path string, stopAfterUser bool) (session.T
 			}
 			// Grok marks injected context it hides from the user's own
 			// scrollback (monitor events, system reminders) with
-			// hideFromScrollback. Everything else is a real turn: a typed
+			// hideFromScrollback, and echoes a slash command such as /compact
+			// as a hostTurn chunk. Everything else is a real turn: a typed
 			// prompt, or a mid-turn interjection whose text is wrapped in
 			// <user_query>, which extractUserQuery unwraps.
-			if hideBool(u.Meta.HideFromScrollback) {
+			if u.Meta.HideFromScrollback || u.Meta.HostTurn {
 				continue
 			}
 			q := extractUserQuery(u.Content.Text)
@@ -537,6 +505,7 @@ func readUpdates(src session.Source, path string, stopAfterUser bool) (session.T
 				continue
 			}
 			flush()
+			markRetained(entries)
 			entries = append(entries, session.Entry{Kind: session.KindCompact, Text: checkpointSummary(src.Path, c.CheckpointFile), Time: ts})
 		default:
 			if acpIgnored[kind.SessionUpdate] {
@@ -565,13 +534,6 @@ func lineTime(ms, secs int64) time.Time {
 		return time.Unix(secs, 0)
 	}
 	return time.Time{}
-}
-
-// hideBool reads hideFromScrollback, which Grok has written both as a JSON
-// boolean and as the string "True".
-func hideBool(raw json.RawMessage) bool {
-	s := strings.TrimSpace(string(raw))
-	return s == "true" || strings.EqualFold(s, `"true"`)
 }
 
 // textArray joins the text of a content block array, the shape tool_call_update
@@ -603,39 +565,17 @@ func textArray(raw json.RawMessage) string {
 	return strings.Join(parts, "\n")
 }
 
-// toolFailureText reads a failed call's output: the content blocks first, then
-// rawOutput, which is a plain string or an object with a nested text field.
+// toolFailureText reads a failed call's output: the content blocks when there
+// are any, else rawOutput, Grok's serialized ToolOutput (e.g.
+// {"type":"ListDir","NotFound":...}), kept as JSON.
 func toolFailureText(content, rawOutput json.RawMessage) string {
 	if s := textArray(content); s != "" {
 		return s
 	}
-	if s := rawOutputText(rawOutput); s != "" {
-		return s
+	if len(bytes.TrimSpace(rawOutput)) > 0 {
+		return string(rawOutput)
 	}
 	return "tool call failed"
-}
-
-func rawOutputText(raw json.RawMessage) string {
-	if len(raw) == 0 {
-		return ""
-	}
-	var s string
-	if json.Unmarshal(raw, &s) == nil {
-		return s
-	}
-	var obj map[string]json.RawMessage
-	if json.Unmarshal(raw, &obj) != nil {
-		return string(raw)
-	}
-	for _, key := range []string{"content", "output", "text", "stdout", "error", "message"} {
-		if v, ok := obj[key]; ok {
-			var inner string
-			if json.Unmarshal(v, &inner) == nil && strings.TrimSpace(inner) != "" {
-				return inner
-			}
-		}
-	}
-	return string(raw)
 }
 
 // checkpointSummary reads the compaction summary Grok saved for a seam, so
@@ -660,124 +600,27 @@ func checkpointSummary(sessionDir, file string) string {
 	if json.Unmarshal(b, &c) != nil {
 		return ""
 	}
+	// The first compaction_meta record is the environment prefix (cwd, date)
+	// that opens every rebuilt context; the rest are the summary and any
+	// image-path note (xai-chat-state build_compacted_history).
 	var parts []string
+	prefix := true
 	for _, it := range c.CompactedHistory {
-		if it.Type == "user" && it.SyntheticReason != nil && *it.SyntheticReason == "compaction_meta" {
+		if it.Type != "user" || it.SyntheticReason == nil || *it.SyntheticReason != "compaction_meta" {
+			continue
+		}
+		if !prefix {
 			parts = append(parts, textArray(it.Content))
 		}
+		prefix = false
 	}
 	return strings.Join(parts, "\n")
-}
-
-// --- fallback timeline (chat_history.jsonl) ---------------------------------
-
-// grokUser decodes a user record's content blocks and its synthetic marker.
-type grokUser struct {
-	Content []struct {
-		Type string `json:"type"`
-		Text string `json:"text"`
-	} `json:"content"`
-	SyntheticReason *string `json:"synthetic_reason"`
-}
-
-// grokAssistant decodes an assistant record. content is a plain string, empty
-// on a tool-only row.
-type grokAssistant struct {
-	Content string `json:"content"`
-	ModelID string `json:"model_id"`
 }
 
 // toolCall is the name and structured input of an assistant tool call.
 type toolCall struct {
 	name  string
 	input json.RawMessage
-}
-
-// readChat parses chat_history.jsonl. It is the fallback for a session with no
-// (or an oversized) updates.jsonl. It has no timestamps or error flags.
-// A missing transcript is not an error.
-func readChat(src session.Source, path string) (session.Thread, error) {
-	f, err := os.Open(path)
-	if errors.Is(err, fs.ErrNotExist) {
-		return session.Thread{Source: src}, nil
-	}
-	if err != nil {
-		return session.Thread{}, err
-	}
-	defer f.Close()
-
-	var entries []session.Entry
-	var warnings []string
-	var unknown session.UnknownTypes
-	model := ""
-
-	dec := json.NewDecoder(f)
-	for dec.More() {
-		var raw json.RawMessage
-		if err := dec.Decode(&raw); err != nil {
-			warnings = append(warnings, session.ReadStopWarning(err))
-			break
-		}
-		var rec struct {
-			Type string `json:"type"`
-		}
-		if json.Unmarshal(raw, &rec) != nil {
-			continue
-		}
-		switch rec.Type {
-		case "user":
-			var u grokUser
-			if json.Unmarshal(raw, &u) != nil {
-				continue
-			}
-			text := userText(u)
-			if u.SyntheticReason != nil {
-				if *u.SyntheticReason == "compaction_meta" {
-					markRetained(entries)
-					entries = append(entries, session.Entry{Kind: session.KindCompact, Text: text})
-				}
-				continue
-			}
-			if q := extractUserQuery(text); q != "" {
-				entries = append(entries, session.Entry{Kind: session.KindMessage, Role: session.RoleUser, Text: q})
-			}
-		case "assistant":
-			var a grokAssistant
-			if json.Unmarshal(raw, &a) != nil {
-				continue
-			}
-			if a.ModelID != "" {
-				model = a.ModelID
-			}
-			if strings.TrimSpace(a.Content) != "" {
-				entries = append(entries, session.Entry{Kind: session.KindMessage, Role: session.RoleAssistant, Text: a.Content})
-			}
-		case "system", "reasoning", "tool_result", "backend_tool_call", "custom_tool_output":
-			// The system prompt, model scratch work, and tool plumbing.
-		default:
-			unknown.Add(rec.Type)
-		}
-	}
-
-	if model != "" {
-		if src.Metadata == nil {
-			src.Metadata = map[string]string{}
-		}
-		src.Metadata["model"] = model
-	}
-	return session.Thread{Source: src, Entries: entries, Warnings: unknown.AppendTo(warnings)}, nil
-}
-
-// userText joins a user record's text blocks with newlines; image blocks carry
-// no text.
-func userText(u grokUser) string {
-	var parts []string
-	for _, b := range u.Content {
-		if b.Type == "text" && b.Text != "" {
-			parts = append(parts, b.Text)
-		}
-	}
-	return strings.Join(parts, "\n")
 }
 
 const (
@@ -787,8 +630,7 @@ const (
 
 // extractUserQuery returns a real user turn's words. Grok wraps a prompt with
 // injected context, the actual request inside <user_query>…</user_query>; when
-// the tags are absent the whole text is returned (so this also serves the
-// fallback reader, whose real user record may be the bare prompt).
+// the tags are absent the whole text is returned.
 func extractUserQuery(text string) string {
 	i := strings.Index(text, userQueryOpen)
 	if i < 0 {
@@ -801,16 +643,16 @@ func extractUserQuery(text string) string {
 	return strings.TrimSpace(rest)
 }
 
-// markRetained flags the messages already read as having survived the
-// compaction about to be marked. Only the fallback reader needs it: chat_history
-// is replaced at a compaction, so everything still in the file was handed back
-// to the model, and --since-compact must keep it rather than cut it away. The
-// updates.jsonl reader keeps the whole history, so it needs no marks.
+// markRetained flags the one message the compaction about to be appended kept
+// verbatim. Grok rebuilds the context from its summary and the last real user
+// turn, dropping the assistant and tool tail (xai-grok-shell compaction.rs,
+// for_compaction). Every other mark is cleared, so only the last compaction
+// counts. Unverified: in goal mode Grok keeps the goal objective instead.
 func markRetained(entries []session.Entry) {
-	for i := range entries {
-		switch entries[i].Kind {
-		case session.KindMessage, session.KindFailure:
-			entries[i].Retained = true
-		}
+	kept := false
+	for i := len(entries) - 1; i >= 0; i-- {
+		user := entries[i].Kind == session.KindMessage && entries[i].Role == session.RoleUser
+		entries[i].Retained = user && !kept
+		kept = kept || user
 	}
 }

@@ -14,3 +14,4 @@
 {"timestamp":14,"method":"_x.ai/session/update","params":{"sessionId":"fixture-session","update":{"sessionUpdate":"turn_completed","prompt_id":"redacted","stop_reason":"error","agent_result":"redacted"},"_meta":{"agentTimestampMs":14000}}}
 {"timestamp":15,"method":"session/update","params":{"sessionId":"fixture-session","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"all "}},"_meta":{"agentTimestampMs":15000}}}
 {"timestamp":16,"method":"session/update","params":{"sessionId":"fixture-session","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"done"}},"_meta":{"agentTimestampMs":16000}}}
+{"timestamp":17,"method":"session/update","params":{"sessionId":"fixture-session","update":{"sessionUpdate":"user_message_chunk","content":{"type":"text","text":"/compact"},"_meta":{"hostTurn":true}},"_meta":{"agentTimestampMs":17000}}}

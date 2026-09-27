@@ -1,7 +1,0 @@
-{"type":"system","content":"system-only-token"}
-{"type":"user","content":[{"type":"text","text":"injected context"}],"synthetic_reason":"compaction_meta"}
-{"type":"user","content":[{"type":"text","text":"support grok"}]}
-{"type":"user","content":[{"type":"text","text":"the compaction summary"}],"synthetic_reason":"compaction_meta"}
-{"type":"user","content":[{"type":"text","text":"reminder_token"}],"synthetic_reason":"system_reminder"}
-{"type":"reasoning","id":"redacted","summary":[{"type":"summary_text","text":"redacted"}],"encrypted_content":"redacted","status":"completed"}
-{"type":"assistant","content":"I will read the log.","tool_calls":[{"id":"redacted","name":"todo_write","arguments":"redacted"},{"id":"redacted","name":"read_file","arguments":"redacted"},{"id":"redacted","name":"run_terminal_command","arguments":"redacted"}],"model_id":"grok-build","model_fingerprint":"redacted","reasoning_effort":"redacted"}
