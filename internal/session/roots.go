@@ -17,6 +17,7 @@ import "path/filepath"
 //	ZCode    : $ZCODE_HOME          else <home>/.zcode/cli/db (the dir holding db.sqlite)
 //	DeepSeek : $DSH_HOME            else <home>/.dsh
 //	Copilot  : $COPILOT_HOME        else <home>/.copilot
+//	Grok     : $GROK_HOME           else <home>/.grok
 //
 // getenv and home are passed in rather than read from the os package so that
 // root resolution is a pure function and can be tested without touching the
@@ -89,7 +90,13 @@ func ResolveRoots(getenv func(string) string, home string) Roots {
 		}
 		amp = filepath.Join(base, "amp")
 	}
-	return Roots{Amp: amp, Codex: codex, Claude: claude, Agy: agy, OpenCode: opencode, PiAgent: piAgent, Kimi: kimi, Cline: cline, Cursor: cursor, ZCode: zcode, DeepSeek: deepseek, Copilot: copilot}
+
+	grok := getenv("GROK_HOME")
+	if grok == "" {
+		grok = filepath.Join(home, ".grok")
+	}
+
+	return Roots{Amp: amp, Codex: codex, Claude: claude, Agy: agy, OpenCode: opencode, PiAgent: piAgent, Kimi: kimi, Cline: cline, Cursor: cursor, ZCode: zcode, DeepSeek: deepseek, Copilot: copilot, Grok: grok}
 }
 
 // ResolveSkillDirs returns each provider's global Agent Skills directory,
@@ -118,6 +125,7 @@ func ResolveRoots(getenv func(string) string, home string) Roots {
 //	           also discovers ~/.agents/skills — Codex's entry, same reasoning)
 //	DeepSeek : roots.DeepSeek/skills         (respects $DSH_HOME; dsh also
 //	           discovers ~/.agents/skills — Codex's entry, same reasoning)
+//	Grok     : roots.Grok/skills             (respects $GROK_HOME)
 func ResolveSkillDirs(roots Roots, home string) map[string]string {
 	return map[string]string{
 		ProviderAmp:      filepath.Join(home, ".config", "amp", "skills"),
@@ -132,6 +140,7 @@ func ResolveSkillDirs(roots Roots, home string) map[string]string {
 		ProviderZCode:    filepath.Join(home, ".agents", "skills"),
 		ProviderDeepSeek: filepath.Join(roots.DeepSeek, "skills"),
 		ProviderCopilot:  filepath.Join(roots.Copilot, "skills"),
+		ProviderGrok:     filepath.Join(roots.Grok, "skills"),
 	}
 }
 
