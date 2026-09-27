@@ -78,11 +78,20 @@ func TestRead(t *testing.T) {
 		{Kind: "stop", Reason: "error", Time: at(14)},
 		{Kind: "message", Role: "assistant", Text: "all done", Time: at(15)},
 	}
-	// A second compaction keeps only its own last user turn.
+	// A second compaction moves the mark to its own last real user turn: the
+	// typed /loop, not the interjection after it. Both lines are shaped from
+	// grok-build 4247f661 source, not observed in a log: a /loop prompt
+	// (xai-grok-shell slash_commands.rs, instruction abbreviated) and a mid-turn
+	// interjection (interjection.rs, xai-interjection-core format.rs).
 	lines := strings.SplitAfter(acpLog, "\n")
+	loop := `{"timestamp":18,"method":"session/update","params":{"sessionId":"fixture-session","update":{"sessionUpdate":"user_message_chunk","content":{"type":"text","text":"# /loop -- schedule a recurring prompt\n\n## Input\n5m check CI","_meta":{"displayText":"/loop 5m check CI"}},"_meta":{"modelId":"grok-build","promptIndex":18}},"_meta":{"agentTimestampMs":18000}}}` + "\n"
+	interjection := `{"timestamp":19,"method":"session/update","params":{"sessionId":"fixture-session","update":{"sessionUpdate":"user_message_chunk","content":{"type":"text","text":"The user sent a message while you were working:\n<user_query>\nalso update the docs\n</user_query>\nMake sure to complete any unfinished tasks from previous turns.","_meta":{"displayText":"also update the docs"}},"_meta":{"modelId":"grok-build","interjection":true}},"_meta":{"agentTimestampMs":19000}}}` + "\n"
 	again := slices.Clone(updates)
-	again[0].Retained, again[6].Retained = false, true
-	again = append(again, session.Entry{Kind: "compact", Text: "the compaction summary", Time: at(11)})
+	again[0].Retained = false
+	again = append(again,
+		session.Entry{Kind: "message", Role: "user", Text: "/loop 5m check CI", Time: at(18), Retained: true},
+		session.Entry{Kind: "message", Role: "user", Text: "also update the docs", Time: at(19)},
+		session.Entry{Kind: "compact", Text: "the compaction summary", Time: at(11)})
 	unknown := `{"params":{"update":{"sessionUpdate":"future_kind"}}}` + "\n"
 	// The pre-envelope line upstream still reads (storage/mod.rs tests).
 	legacy := `{"sessionId":"s","update":{"sessionUpdate":"user_message_chunk","content":{"type":"text","text":"legacy prompt"}}}`
@@ -92,7 +101,7 @@ func TestRead(t *testing.T) {
 		warnings      []string
 	}{
 		{"updates", acpLog, updates, nil},
-		{"second compaction", acpLog + lines[10], again, nil},
+		{"second compaction", acpLog + loop + interjection + lines[10], again, nil},
 		{"timestamp fallback", strings.Replace(acpLog, `"agentTimestampMs":1000`, `"unused":1000`, 1), updates, nil},
 		{"duplicate failure", acpLog + lines[7], updates, nil},
 		{"torn updates", acpLog + `{"params":`, updates, []string{"malformed record"}},

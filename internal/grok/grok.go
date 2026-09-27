@@ -308,10 +308,16 @@ type contentObject struct {
 // is an object for a message chunk and an array for a tool result), and one
 // shared struct would fail a whole line on the first mismatch.
 type acpUserChunk struct {
-	Content contentObject `json:"content"`
-	Meta    struct {
+	Content struct {
+		contentObject
+		Meta struct {
+			DisplayText string `json:"displayText"`
+		} `json:"_meta"`
+	} `json:"content"`
+	Meta struct {
 		HideFromScrollback bool `json:"hideFromScrollback"`
 		HostTurn           bool `json:"hostTurn"`
+		Interjection       bool `json:"interjection"`
 	} `json:"_meta"`
 }
 
@@ -391,6 +397,7 @@ func readUpdates(src session.Source, stopAfterUser bool) (session.Thread, error)
 	var abuf strings.Builder
 	var atime time.Time
 	gotUser := false
+	lastReal := -1 // the last user turn a compaction would keep
 
 	flush := func() {
 		if abuf.Len() == 0 {
@@ -433,15 +440,26 @@ func readUpdates(src session.Source, stopAfterUser bool) (session.Thread, error)
 			// hideFromScrollback, and echoes a slash command such as /compact
 			// as a hostTurn chunk. Everything else is a real turn: a typed
 			// prompt, or a mid-turn interjection whose text is wrapped in
-			// <user_query>, which extractUserQuery unwraps.
+			// <user_query>, which extractUserQuery unwraps. A command that
+			// expands into a generated instruction (/loop, /imagine) keeps
+			// what was typed in displayText, which Grok's own replay shows.
 			if u.Meta.HideFromScrollback || u.Meta.HostTurn {
 				continue
 			}
-			q := extractUserQuery(u.Content.Text)
+			text := u.Content.Text
+			if u.Content.Meta.DisplayText != "" {
+				text = u.Content.Meta.DisplayText
+			}
+			q := extractUserQuery(text)
 			if q == "" {
 				continue
 			}
 			flush()
+			// Compaction keeps the last human turn, never an interjection
+			// (xai-chat-state is_real_user_turn).
+			if !u.Meta.Interjection {
+				lastReal = len(entries)
+			}
 			entries = append(entries, session.Entry{Kind: session.KindMessage, Role: session.RoleUser, Text: q, Time: ts})
 			gotUser = true
 		case "agent_message_chunk":
@@ -505,7 +523,13 @@ func readUpdates(src session.Source, stopAfterUser bool) (session.Thread, error)
 				continue
 			}
 			flush()
-			markRetained(entries)
+			// Grok rebuilds the context from its summary and the last real
+			// user turn, dropping the assistant and tool tail (xai-grok-shell
+			// compaction.rs, for_compaction). Only the last compaction's mark
+			// counts. Unverified: in goal mode Grok keeps the goal objective.
+			for i := range entries {
+				entries[i].Retained = i == lastReal
+			}
 			entries = append(entries, session.Entry{Kind: session.KindCompact, Text: checkpointSummary(src.Path, c.CheckpointFile), Time: ts})
 		default:
 			if acpIgnored[kind.SessionUpdate] {
@@ -641,18 +665,4 @@ func extractUserQuery(text string) string {
 		return strings.TrimSpace(rest[:j])
 	}
 	return strings.TrimSpace(rest)
-}
-
-// markRetained flags the one message the compaction about to be appended kept
-// verbatim. Grok rebuilds the context from its summary and the last real user
-// turn, dropping the assistant and tool tail (xai-grok-shell compaction.rs,
-// for_compaction). Every other mark is cleared, so only the last compaction
-// counts. Unverified: in goal mode Grok keeps the goal objective instead.
-func markRetained(entries []session.Entry) {
-	kept := false
-	for i := len(entries) - 1; i >= 0; i-- {
-		user := entries[i].Kind == session.KindMessage && entries[i].Role == session.RoleUser
-		entries[i].Retained = user && !kept
-		kept = kept || user
-	}
 }
