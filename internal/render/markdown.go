@@ -82,6 +82,10 @@ func writeEntry(b *strings.Builder, n int, e session.Entry) {
 		writeCodeBlock(b, strings.TrimRight(e.Text, "\n"))
 		return
 	}
+	if e.Kind == session.KindToolCall {
+		writeCodeBlock(b, StripControl(e.InputText()))
+		return
+	}
 	text := strings.TrimRight(e.Text, "\n")
 	if text == "" && e.Kind == session.KindCompact {
 		text = "_(context compacted)_"

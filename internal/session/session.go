@@ -14,6 +14,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"slices"
 	"strings"
 	"time"
 )
@@ -56,12 +57,15 @@ var Providers = []string{
 // saying no to something the assistant tried. Successful tool results never
 // become Entries: the assistant's next words already carry what they said.
 // KindStop is a provider-reported API error, not something the assistant said.
+// KindToolCall is a call the assistant made: Tool names it and Input carries
+// its arguments. It is an optional kind, shown only on request (Thread.Visible).
 const (
-	KindMessage = "message"
-	KindCompact = "compact"
-	KindBranch  = "branch"
-	KindFailure = "failure"
-	KindStop    = "stop"
+	KindMessage  = "message"
+	KindCompact  = "compact"
+	KindBranch   = "branch"
+	KindFailure  = "failure"
+	KindStop     = "stop"
+	KindToolCall = "tool_call"
 
 	RoleUser      = "user"
 	RoleAssistant = "assistant"
@@ -123,8 +127,8 @@ type Source struct {
 }
 
 // Entry is one visible item on the conversation timeline. Kind is KindMessage,
-// KindCompact, KindBranch, KindFailure, or KindStop; for messages, Role is RoleUser or
-// RoleAssistant. Tool calls, successful tool results, reasoning, and
+// KindCompact, KindBranch, KindFailure, KindStop, or KindToolCall; for messages, Role
+// is RoleUser or RoleAssistant. Successful tool results, reasoning, and
 // bookkeeping never become Entries; a tool result the log marks failed does,
 // as a KindFailure whose Text is what came back. Provider API errors become
 // KindStop entries so their text cannot be mistaken for assistant speech.
@@ -134,10 +138,10 @@ type Entry struct {
 	Text string
 	Time time.Time
 
-	// Tool and Input are set only on KindFailure entries: the provider's own
-	// name for the tool that was called, and what it was asked to do. Input is the
-	// compact JSON value from the provider so JSON output stays structured; text
-	// renderers choose their own human-readable projection.
+	// Tool and Input are set only on KindFailure and KindToolCall entries: the
+	// provider's own name for the tool that was called, and what it was asked to
+	// do. Input is the JSON value from the provider so JSON output stays
+	// structured; text renderers choose their own human-readable projection.
 	Tool  string
 	Input string
 	// Reason is the provider's error code for a KindStop entry.
@@ -161,6 +165,20 @@ func Failure(tool string, input json.RawMessage, text string, at time.Time) Entr
 	}
 }
 
+// ToolCall builds the entry for a call the assistant made. Unlike Failure it
+// keeps valid JSON input as written, not compacted: a query matches the input,
+// and the listing prefilter answers from the session's bytes, which hold ": 1"
+// where compact JSON would hold ":1". Other input degrades as Failure's does.
+// The text stays empty: the input is what a reader and a query see.
+func ToolCall(tool string, input json.RawMessage, at time.Time) Entry {
+	raw := bytes.TrimSpace(input)
+	in := string(raw)
+	if in == "null" || !json.Valid(raw) {
+		in = compactInput(raw)
+	}
+	return Entry{Kind: KindToolCall, Tool: tool, Input: in, Time: at}
+}
+
 // compactInput preserves a provider's structured call input as valid compact
 // JSON. A malformed value degrades to a JSON string instead of making the
 // renderer's JSON document invalid.
@@ -178,7 +196,7 @@ func compactInput(raw json.RawMessage) string {
 }
 
 // InputText is the faithful reading of Input for text output. Objects and
-// arrays stay compact JSON so a receiving agent keeps field names, argv, and
+// arrays stay JSON so a receiving agent keeps field names, argv, and
 // other structure; a scalar JSON string is shown without its encoding quotes.
 func (e Entry) InputText() string {
 	if e.Input == "" {
@@ -210,6 +228,39 @@ type Thread struct {
 	// matching failure visible in otherwise-clean human output; agent and JSON
 	// output retain every failure in the selected turns regardless.
 	Query string
+
+	// Shown is the optional kinds Visible kept. Renderers use it the way they
+	// use Query: shown tool calls keep their failures in human output too.
+	Shown []string
+}
+
+// optionalKinds are recorded by the providers that can read them but shown
+// only on request, so a view that asks for none of them reads exactly as it
+// did before they were recorded.
+var optionalKinds = []string{KindToolCall}
+
+// Visible returns t without the optional entries show does not name. It is the
+// one place they are hidden: callers apply it straight after reading a thread,
+// before anything trims, searches, or counts its entries.
+func (t Thread) Visible(show []string) Thread {
+	kept := t.Entries[:0:0]
+	for _, e := range t.Entries {
+		if !slices.Contains(optionalKinds, e.Kind) || slices.Contains(show, e.Kind) {
+			kept = append(kept, e)
+		}
+	}
+	t.Entries = kept
+	t.Shown = show
+	return t
+}
+
+// searchText is what a keyword query is matched against in one entry: its
+// text, or a tool call's input.
+func (e Entry) searchText() string {
+	if e.Kind == KindToolCall {
+		return e.InputText()
+	}
+	return e.Text
 }
 
 // Preview returns the thread's first user message, or failing that its first
@@ -300,6 +351,7 @@ type ListOptions struct {
 	Query string
 	Cwd   string
 	Limit int
+	Show  []string // optional entry kinds a listing keeps; see Thread.Visible
 }
 
 // EffectiveLimit returns Limit, or DefaultListLimit when Limit is unset.

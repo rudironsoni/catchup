@@ -20,9 +20,12 @@
 // on; earlier rollouts record the outcome only as prose inside
 // function_call_output, which is not a flag, so they yield nothing.
 //
-// Ignored by default: function_call, function_call_output, custom_tool_call,
-// web_search_call, MCP/tool events, patches, token counts, rate limits, memory
-// citations, encrypted reasoning, turn_context, base instructions, and
+// function_call, custom_tool_call, tool_search_call, and web_search_call become
+// tool-call entries; see toolCall. A session read from the event_msg fallback
+// has none.
+//
+// Ignored by default: tool outputs, MCP/tool events, patches, token counts, rate
+// limits, memory citations, encrypted reasoning, turn_context, base instructions, and
 // developer-role messages. event_msg.agent_message is a fallback only when
 // canonical response_item messages are absent.
 package codex
@@ -173,7 +176,7 @@ func listSessions(root string, opts session.ListOptions) ([]session.Summary, err
 			}
 		}
 		t, err := readThread(fi)
-		if err != nil || len(t.Entries) == 0 {
+		if err != nil || !opts.Listable(&t) {
 			continue
 		}
 		enrich(&t.Source, titles)
@@ -317,8 +320,9 @@ func readThread(fi fileInfo) (session.Thread, error) {
 				}
 				entries = append(entries, session.Entry{Kind: session.KindMessage, Role: role, Text: text, Time: ts})
 				haveMessage = true
-			case "agent_message", "custom_tool_call", "custom_tool_call_output", "function_call", "function_call_output",
-				"reasoning", "tool_search_call", "tool_search_output", "web_search_call":
+			case "custom_tool_call", "function_call", "tool_search_call", "web_search_call":
+				entries = append(entries, toolCall(line.Payload, ts))
+			case "agent_message", "custom_tool_call_output", "function_call_output", "reasoning", "tool_search_output":
 				// Model scratch work and tool plumbing represented elsewhere.
 			default:
 				unknown.Add("response_item/" + ptype)
@@ -503,6 +507,36 @@ func failedCommand(raw json.RawMessage, ts time.Time) (session.Entry, bool) {
 	}
 	text += fmt.Sprintf("exit status %d", *p.Item.ExitCode)
 	return session.Failure(p.Item.Type, p.Item.Command, text, ts), true
+}
+
+// toolCall converts a response item the model spent on a tool. Codex spells the
+// input four ways: function_call arguments as JSON encoded in a string,
+// tool_search_call arguments as an object, custom_tool_call input as raw text (an
+// exec script or an apply_patch patch), and a web_search_call's action. The
+// last has no name, so the entry takes the item type.
+func toolCall(raw json.RawMessage, ts time.Time) session.Entry {
+	var c struct {
+		Type      string          `json:"type"`
+		Name      string          `json:"name"`
+		Arguments json.RawMessage `json:"arguments"`
+		Input     json.RawMessage `json:"input"`
+		Action    json.RawMessage `json:"action"`
+	}
+	json.Unmarshal(raw, &c)
+	input := c.Arguments
+	var encoded string
+	if json.Unmarshal(c.Arguments, &encoded) == nil {
+		input = json.RawMessage(encoded)
+	}
+	if c.Input != nil {
+		input = c.Input
+	} else if c.Action != nil {
+		input = c.Action
+	}
+	if c.Name == "" {
+		c.Name = c.Type
+	}
+	return session.ToolCall(c.Name, input, ts)
 }
 
 // exitStatus prefixes the suffix failedCommand appends to a failed command. It

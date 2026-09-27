@@ -61,8 +61,10 @@ func TestReadThread(t *testing.T) {
 	}
 	want := []struct{ kind, role, text string }{
 		{session.KindMessage, session.RoleUser, "implement the parser"},
-		{session.KindMessage, session.RoleAssistant, "on it"}, // thinking + tool_use dropped
+		{session.KindMessage, session.RoleAssistant, "on it"}, // thinking dropped; the text leads its call
+		{session.KindToolCall, "", ""},
 		{session.KindFailure, session.RoleTool, "FAIL\tproj\nexit status 1"},
+		{session.KindToolCall, "", ""},
 		{session.KindCompact, "", "summary so far"},
 	}
 	if len(th.Entries) != len(want) {
@@ -74,9 +76,11 @@ func TestReadThread(t *testing.T) {
 			t.Errorf("entry %d = %+v, want %v", i, got, w)
 		}
 	}
-	// The failure is paired with its tool_use for the name and input.
-	if f := th.Entries[2]; f.Tool != "Bash" || f.Input != `{"command":"go test ./..."}` {
-		t.Errorf("failure = %+v, want Tool Bash with structured command input", f)
+	// The call and the failure it met both carry the tool_use's name and input.
+	for _, i := range []int{2, 3} {
+		if e := th.Entries[i]; e.Tool != "Bash" || e.Input != `{"command":"go test ./..."}` {
+			t.Errorf("entry %d = %+v, want Tool Bash with structured command input", i, e)
+		}
 	}
 	// The successful Read never reaches the timeline.
 	if strings.Contains(th.VisibleText(), "tool output") {

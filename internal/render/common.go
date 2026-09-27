@@ -104,6 +104,8 @@ func entryLabel(e session.Entry) string {
 		return "failure: " + e.Tool
 	case e.Kind == session.KindStop:
 		return "stop: " + e.Reason
+	case e.Kind == session.KindToolCall:
+		return "call: " + e.Tool
 	case e.Role != "":
 		return e.Role
 	default:

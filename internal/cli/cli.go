@@ -54,6 +54,8 @@ RECAP — how much of the session (default: all of it)
   --since-compact     what the agent resumed with after compacting
   --last <N>          just the last N exchanges
   --full              oversized messages whole, not clamped
+  --show tools        the agent's tool calls (claude, codex) and failures
+                      too; -q then searches the calls
   -i, --info          metadata only, no messages
 
 FIND — which session (default: newest here)
@@ -77,7 +79,7 @@ HAND OFF — continue the work
 OUTPUT — as what (default: Markdown)
   --md, --markdown    clean Markdown for people (the default)
   --agent             detailed Markdown for an LLM, with failures and API stops
-  --json              complete JSON for scripts (never clamped)
+  --json              JSON for scripts (never clamped)
   --html              a clean self-contained page for people
 
 Meta: --version (print version; names a newer release when your terminal
@@ -219,7 +221,7 @@ func Run(ctx context.Context, args []string, roots session.Roots, current map[st
 	}
 
 	if cmd.List {
-		opts := session.ListOptions{Query: cmd.Target.Query, Cwd: cwd, Limit: cmd.Limit}
+		opts := session.ListOptions{Query: cmd.Target.Query, Cwd: cwd, Limit: cmd.Limit, Show: cmd.Show}
 		summaries, err := prov.List(ctx, roots, opts)
 		if err != nil {
 			return err
@@ -243,6 +245,7 @@ func Run(ctx context.Context, args []string, roots session.Roots, current map[st
 	if err != nil {
 		return err
 	}
+	thread = visible(thread, cmd.Show, stderr)
 	// A query that reached a read has already picked the session; here it picks
 	// the part of it. Rank resolution filtered on the same predicate, so only
 	// --id, which bypasses the filter, can reach a session that does not hold
@@ -273,7 +276,7 @@ func Run(ctx context.Context, args []string, roots session.Roots, current map[st
 // does in catchup claude --list — so only row order is merged, never the
 // numbering.
 func listAcross(ctx context.Context, roots session.Roots, cmd Command, cwd string, stdout, stderr io.Writer) error {
-	opts := session.ListOptions{Query: cmd.Target.Query, Cwd: cwd, Limit: cmd.Limit}
+	opts := session.ListOptions{Query: cmd.Target.Query, Cwd: cwd, Limit: cmd.Limit, Show: cmd.Show}
 	var merged []session.Summary
 	for _, name := range session.Providers {
 		prov, _ := selectProvider(name) // session.Providers is the closed set selectProvider switches on
@@ -440,7 +443,7 @@ func locateForkSource(ctx context.Context, roots session.Roots, cmd Command, cwd
 
 	t := cmd.Target
 	if t.Query != "" && t.Rank == 0 && t.SessionID == "" {
-		sums, err := prov.List(ctx, roots, session.ListOptions{Query: t.Query, Cwd: cwd, Limit: cmd.Limit})
+		sums, err := prov.List(ctx, roots, session.ListOptions{Query: t.Query, Cwd: cwd, Limit: cmd.Limit, Show: cmd.Show})
 		if err != nil {
 			return session.Source{}, false, err
 		}
@@ -720,6 +723,7 @@ func forkInto(ctx context.Context, src session.Source, cmd Command, launchDir st
 	if err != nil {
 		return err
 	}
+	thread = visible(thread, cmd.Show, stderr)
 	if cmd.SinceCompact {
 		thread = sinceCompact(thread)
 	}
@@ -1095,13 +1099,25 @@ func locate(ctx context.Context, prov session.Provider, roots session.Roots, cmd
 	case cmd.Target.SessionID != "":
 		return prov.Resolve(ctx, roots, cmd.Target.SessionID)
 	case cmd.Target.Rank > 0:
-		opts := session.ListOptions{Query: cmd.Target.Query, Cwd: cwd}
+		opts := session.ListOptions{Query: cmd.Target.Query, Cwd: cwd, Show: cmd.Show}
 		return resolveRank(ctx, prov, cmd.Target.Provider, roots, opts, cmd.Target.Rank)
 	case current[cmd.Target.Provider] != "":
 		return prov.Resolve(ctx, roots, current[cmd.Target.Provider])
 	default:
 		return newestInCwd(ctx, prov, roots, cmd.Target.Provider, cwd)
 	}
+}
+
+// visible hides the optional entries --show did not ask for; every read goes
+// through it before any trim, so the trims count only what will be shown. A
+// session that holds none of them, because it made no calls or because its
+// agent's calls are not read, gets a warning rather than a silent no-op.
+func visible(t session.Thread, show []string, stderr io.Writer) session.Thread {
+	shown := t.Visible(show)
+	if len(show) > 0 && len(shown.Entries) == len(t.Visible(nil).Entries) {
+		fmt.Fprintln(stderr, "catchup: --show tools: no tool calls read from this session")
+	}
+	return shown
 }
 
 // aroundContext is how many turns on each side of a matched turn a keyword read

@@ -76,6 +76,7 @@ var seedPathRE = regexp.MustCompile(regexp.QuoteMeta(seedDirName) + `[\\/]seed-[
 
 const rollout = `{"timestamp":"2026-06-26T21:31:46.0Z","type":"session_meta","payload":{"id":"sess-1","cwd":"/home/u/src/proj","cli_version":"0.1"}}
 {"timestamp":"2026-06-26T21:31:55.0Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"hello from cli test"}]}}
+{"timestamp":"2026-06-26T21:32:00.0Z","type":"response_item","payload":{"type":"function_call","name":"exec_command","arguments":"{\"timeout_ms\": 120000, \"cmd\": \"rg -n zanzibar\"}","call_id":"call-1"}}
 {"timestamp":"2026-06-26T21:32:08.0Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"hi back"}]}}
 `
 
@@ -113,7 +114,7 @@ func claudeRoot(t *testing.T) session.Roots {
 	write := func(id, text string, mod time.Time) {
 		lines := fmt.Sprintf(
 			`{"type":"user","sessionId":%q,"cwd":"/home/u/proj","timestamp":"2026-06-26T10:00:00Z","message":{"role":"user","content":%q}}
-{"type":"assistant","sessionId":%q,"cwd":"/home/u/proj","timestamp":"2026-06-26T10:00:05Z","message":{"role":"assistant","content":[{"type":"text","text":"ok"}]}}
+{"type":"assistant","sessionId":%q,"cwd":"/home/u/proj","timestamp":"2026-06-26T10:00:05Z","message":{"role":"assistant","content":[{"type":"text","text":"ok"},{"type":"tool_use","id":"tu1","name":"Bash","input":{"command":"rg -n zanzibar"}}]}}
 `, id, text, id)
 		p := filepath.Join(dir, id+".jsonl")
 		if err := os.WriteFile(p, []byte(fxBody(lines)), 0o644); err != nil {
@@ -832,6 +833,24 @@ func runBoth(t *testing.T, roots session.Roots, cwd string, args ...string) (str
 	return out.String(), errOut.String()
 }
 
+// A tool call stays out of a read and a search until --show asks for it; the
+// fixtures' word zanzibar is in a call's input and nowhere else. A search
+// matches the input as the session wrote it, spaces included.
+func TestRunShowTools(t *testing.T) {
+	roots := codexRoot(t)
+	roots.Claude = claudeRoot(t).Claude
+	for _, args := range [][]string{
+		{"codex"}, {"codex", "-q", "zanzibar", "--json"}, {"codex", "-q", ": 120000"}, {"claude", "-q", "zanzibar"},
+	} {
+		if out := run(t, roots, args...); strings.Contains(out, "zanzibar") {
+			t.Errorf("%v shows the hidden call:\n%s", args, out)
+		}
+		if out := run(t, roots, append(args, "--show", "tools")...); !strings.Contains(out, "rg -n zanzibar") {
+			t.Errorf("%v --show tools misses the call:\n%s", args, out)
+		}
+	}
+}
+
 // A bare listing spans every agent: "where was I" is a cross-agent question,
 // and each row names the agent that owns it so the handles stay selectable.
 func TestRunListAcrossAgents(t *testing.T) {
@@ -977,6 +996,9 @@ func TestRunForkInto(t *testing.T) {
 	if !strings.Contains(seeded, "prior codex session") {
 		t.Fatalf("fork --into seed missing source framing, got %q", seeded)
 	}
+	if strings.Contains(seeded, "zanzibar") {
+		t.Fatalf("fork --into seeded a hidden tool call, got %q", seeded)
+	}
 }
 
 // A bare same-agent --into is far more likely a mistyped native fork, so it is
@@ -1075,7 +1097,8 @@ func codexPairRoot(t *testing.T) session.Roots {
 }
 
 // codexFailureRoot writes the smallest session that distinguishes clean human
-// output from the detailed context an agent receives.
+// output from the detailed context an agent receives. As in real cli 0.147+
+// rollouts, the failed command's function_call precedes its item_completed.
 func codexFailureRoot(t *testing.T) session.Roots {
 	t.Helper()
 	root := t.TempDir()
@@ -1085,6 +1108,7 @@ func codexFailureRoot(t *testing.T) session.Roots {
 	}
 	body := `{"timestamp":"2026-09-02T20:00:00Z","type":"session_meta","payload":{"id":"sess-failure","cwd":"/home/u/src/proj"}}
 {"timestamp":"2026-09-02T20:00:01Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"run the tests"}]}}
+{"timestamp":"2026-09-02T20:00:02Z","type":"response_item","payload":{"type":"function_call","name":"exec_command","arguments":"{\"cmd\":\"go test ./...\"}","call_id":"call_1"}}
 {"timestamp":"2026-09-02T20:00:02Z","type":"event_msg","payload":{"type":"item_completed","item":{"type":"CommandExecution","command":["/bin/zsh","-lc","go test ./..."],"exit_code":1,"aggregated_output":"FAIL proj\n"}}}
 `
 	if err := os.WriteFile(filepath.Join(dir, "rollout-sess-failure.jsonl"), []byte(fxBody(body)), 0o644); err != nil {
@@ -1100,6 +1124,13 @@ func TestRunSeparatesHumanAndAgentFailureOutput(t *testing.T) {
 	human := runWithCwd(t, roots, cwd, "codex")
 	if strings.Contains(human, "failure: CommandExecution") || strings.Contains(human, "FAIL proj") {
 		t.Errorf("default markdown exposed tool failure:\n%s", human)
+	}
+	// --show tools asks for the tool activity: the call and what it failed with.
+	tools := runWithCwd(t, roots, cwd, "codex", "--show", "tools")
+	for _, want := range []string{"call: exec_command", "failure: CommandExecution", "FAIL proj"} {
+		if !strings.Contains(tools, want) {
+			t.Errorf("--show tools markdown missing %q:\n%s", want, tools)
+		}
 	}
 	agent := runWithCwd(t, roots, cwd, "codex", "--agent")
 	for _, want := range []string{"failure: CommandExecution", "### Input", "go test ./...", "### Output", "FAIL proj"} {

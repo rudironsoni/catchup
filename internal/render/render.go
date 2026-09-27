@@ -41,12 +41,14 @@ func Thread(w io.Writer, t session.Thread, f session.Format) error {
 }
 
 // withoutDiagnosticEntries returns the clean human projection. Provider API
-// errors and tool failures remain in agent Markdown and JSON as logged facts.
+// errors and tool failures remain in agent Markdown and JSON as logged facts;
+// tool failures also remain here when the thread shows its tool calls.
 func withoutDiagnosticEntries(t session.Thread) session.Thread {
 	var entries []session.Entry
 	removed := false
+	toolsShown := slices.Contains(t.Shown, session.KindToolCall)
 	for i, e := range t.Entries {
-		diagnostic := e.Kind == session.KindFailure || e.Kind == session.KindStop
+		diagnostic := e.Kind == session.KindStop || e.Kind == session.KindFailure && !toolsShown
 		matchingDiagnostic := diagnostic && t.Query != ""
 		if matchingDiagnostic {
 			start, _ := session.IndexFold(e.Text, t.Query)

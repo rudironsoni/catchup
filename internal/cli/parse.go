@@ -25,6 +25,7 @@ type Command struct {
 	AllDirs      bool   // --all-dirs: search every recorded directory
 	Dir          string // --dir <path>: select sessions from this directory instead of the cwd
 	Target       session.Target
+	Show         []string // --show tools: the optional entry kinds to keep; see session.Thread.Visible
 	Format       session.Format
 	MetaOnly     bool // -i: render metadata/frontmatter only
 	Full         bool // --full: render oversized entries whole instead of clamped
@@ -164,6 +165,18 @@ func Parse(args []string) (Command, error) {
 			cmd.LastN = n
 		case "--since-compact":
 			cmd.SinceCompact = true
+		case "--show":
+			v, err := value()
+			if err != nil {
+				return cmd, err
+			}
+			for _, s := range strings.Split(v, ",") {
+				kind, ok := showKinds[s]
+				if !ok {
+					return cmd, fmt.Errorf("--show takes tools, got %q", s)
+				}
+				cmd.Show = append(cmd.Show, kind)
+			}
 		case "--full":
 			cmd.Full = true
 		case "--all-dirs":
@@ -228,6 +241,9 @@ func looksLikeSessionID(s string) bool {
 	}
 	return false
 }
+
+// showKinds maps a --show value to the optional entry kind it reveals.
+var showKinds = map[string]string{"tools": session.KindToolCall}
 
 func setFormat(cmd *Command, set *bool, f session.Format) error {
 	if *set && cmd.Format != f {
@@ -448,6 +464,12 @@ func normalize(cmd *Command) error {
 		case cmd.MetaOnly:
 			return errors.New("-i shows no message bodies, so there is nothing for -q to find in them")
 		}
+	}
+	// --show changes what a transcript holds, so a view without one would
+	// silently ignore it; a listing holds one only as far as -q searches it.
+	if len(cmd.Show) > 0 && (cmd.MetaOnly || cmd.From != "" || cmd.Action == "install-skill" ||
+		cmd.Action == "fork" && cmd.Into == "" || cmd.List && t.Query == "") {
+		return errors.New("--show applies to a read, a -q search, or fork --into")
 	}
 	// Checked after the implicit rule so -q listings are covered too. There
 	// is no HTML listing view; ignoring the flag would be a silent no-op.

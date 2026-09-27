@@ -65,9 +65,13 @@ func clampEntries(t session.Thread, query string) session.Thread {
 	var out []session.Entry
 	for i, e := range t.Entries {
 		text, textOK := clampText(e.Text, query, clampMax(e))
-		// A tool call's input is not searched - MatchedEntries decides on Text
-		// alone - so nothing there is under the match guarantee.
-		input, inputOK := clampText(e.InputText(), "", clampPastedMaxBytes)
+		// A failure's input is not searched - MatchedEntries decides on its Text
+		// alone - so only a tool call's input is under the match guarantee.
+		inputQuery := ""
+		if e.Kind == session.KindToolCall {
+			inputQuery = query
+		}
+		input, inputOK := clampText(e.InputText(), inputQuery, clampPastedMaxBytes)
 		if !textOK && !inputOK {
 			if out != nil {
 				out = append(out, e)

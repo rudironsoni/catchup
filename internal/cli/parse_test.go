@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"reflect"
 	"testing"
 
 	"github.com/wilbeibi/catchup/internal/session"
@@ -213,7 +214,7 @@ func TestParse(t *testing.T) {
 			if err != nil {
 				t.Fatalf("Parse(%q) error: %v", tt.args, err)
 			}
-			if got != tt.want {
+			if !reflect.DeepEqual(got, tt.want) {
 				t.Errorf("Parse(%q)\n got = %+v\nwant = %+v", tt.args, got, tt.want)
 			}
 		})
@@ -278,6 +279,8 @@ func TestParseRejects(t *testing.T) {
 		{"fork", "--into", "claude", "--from", "box:s.md"},                // scp syntax: pipe over ssh instead
 		{"fork", "--into", "claude", "--from", ""},                        // empty value
 		{"install-skill", "codex", "--from", "s.md"},                      // install-skill takes nothing
+		{"codex", "--show", "tool"},                                       // unknown --show kind
+		{"codex", "--show", "tools", "-i"},                                // -i has no transcript to add to
 	}
 	for _, args := range bad {
 		if _, err := Parse(args); err == nil {

@@ -13,9 +13,10 @@
 //
 // A tool_result block with is_error set becomes a failure entry, paired
 // through tool_use_id with the assistant's tool_use block for the tool's name
-// and input. Successful results are not on the timeline.
+// and input. Successful results are not on the timeline. Each tool_use and
+// server_tool_use block becomes a tool-call entry after its record's text.
 //
-// Ignored by default: tool_use, successful tool_result, thinking, queue/mode/
+// Ignored by default: successful tool_result, thinking, queue/mode/
 // permission bookkeeping, file-history snapshots, last-prompt, subagent
 // (isSidechain) and injected (isMeta) entries, user records the harness wrote
 // itself (see harnessWrappers), subagent files under */subagents/*, and
@@ -30,6 +31,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -141,7 +143,7 @@ func listSessions(root string, opts session.ListOptions) ([]session.Summary, err
 			}
 		}
 		t, err := readThread(fi)
-		if err != nil || len(t.Entries) == 0 {
+		if err != nil || !opts.Listable(&t) {
 			continue
 		}
 		if !opts.Matches(t) {
@@ -262,12 +264,17 @@ func readThread(fi fileInfo) (session.Thread, error) {
 		}
 		ts := session.ParseTime(line.Timestamp)
 		blocks := decodeBlocks(line.Message.Content)
+		called := -1 // where this record's first call landed; its message goes ahead of it
 		for _, b := range blocks {
 			switch b.Type {
-			case "tool_use":
+			case "tool_use", "server_tool_use":
 				if b.ID != "" {
 					calls[b.ID] = toolCall{name: b.Name, input: b.Input}
 				}
+				if called < 0 {
+					called = len(entries)
+				}
+				entries = append(entries, session.ToolCall(b.Name, b.Input, ts))
 			case "tool_result":
 				call := calls[b.ToolUseID]
 				delete(calls, b.ToolUseID)
@@ -303,7 +310,10 @@ func readThread(fi fileInfo) (session.Thread, error) {
 		if role == session.RoleUser && harnessOnly(text) {
 			continue // a user record the harness wrote itself, not a turn
 		}
-		entries = append(entries, session.Entry{Kind: session.KindMessage, Role: role, Text: text, Time: ts})
+		if called < 0 {
+			called = len(entries)
+		}
+		entries = slices.Insert(entries, called, session.Entry{Kind: session.KindMessage, Role: role, Text: text, Time: ts})
 	}
 
 	finalizeMeta(&src)

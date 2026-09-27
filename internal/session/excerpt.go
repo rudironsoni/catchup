@@ -51,18 +51,28 @@ func (o ListOptions) Excerpt(e Entry) *Match {
 	if o.Query == "" {
 		return nil
 	}
-	start, end := indexFold(e.Text, o.Query)
+	text := e.searchText()
+	start, end := indexFold(text, o.Query)
 	if start < 0 {
 		return nil
 	}
-	from, to := window(e.Text, start, end)
+	from, to := window(text, start, end)
 	return &Match{
 		Role:            e.Role,
 		Kind:            e.Kind,
-		Text:            e.Text[from:to],
+		Text:            text[from:to],
 		TruncatedBefore: from > 0,
-		TruncatedAfter:  to < len(e.Text),
+		TruncatedAfter:  to < len(text),
 	}
+}
+
+// Listable hides from t the optional entries o.Show does not name and reports
+// whether any entry is left: a session with nothing to show is not a row.
+// Providers call it straight after parsing, so Matches sees only what the row
+// would show.
+func (o ListOptions) Listable(t *Thread) bool {
+	*t = t.Visible(o.Show)
+	return len(t.Entries) > 0
 }
 
 // Summarize projects t into a listing row and attaches the passage that matched.
@@ -101,7 +111,7 @@ func (o ListOptions) MatchedEntries(t Thread) []int {
 	}
 	var hits []int
 	for i, e := range t.Entries {
-		if start, _ := indexFold(e.Text, o.Query); start >= 0 {
+		if start, _ := indexFold(e.searchText(), o.Query); start >= 0 {
 			hits = append(hits, i)
 		}
 	}

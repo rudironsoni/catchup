@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -32,10 +33,13 @@ const rolloutOne = `{"timestamp":"2026-06-26T21:31:46.0Z","type":"session_meta",
 {"timestamp":"2026-06-26T21:31:50.0Z","type":"response_item","payload":{"type":"message","role":"developer","content":[{"type":"input_text","text":"<permissions>"}]}}
 {"timestamp":"2026-06-26T21:31:52.0Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"# AGENTS.md instructions for /home/u/src/proj\n\n<INSTRUCTIONS>\nbe nice\n</INSTRUCTIONS>"}]}}
 {"timestamp":"2026-06-26T21:31:55.0Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"hello codex"}]}}
-{"timestamp":"2026-06-26T21:32:00.0Z","type":"response_item","payload":{"type":"function_call","name":"shell","arguments":"{}"}}
+{"timestamp":"2026-06-26T21:32:00.0Z","type":"response_item","payload":{"type":"function_call","name":"exec_command","arguments":"{\"cmd\":\"go test ./...\",\"workdir\":\"/home/u/src/proj\"}","call_id":"call-1"}}
 {"timestamp":"2026-06-26T21:32:01.0Z","type":"event_msg","payload":{"type":"item_completed","item":{"type":"CommandExecution","id":"exec-1","command":["/bin/zsh","-lc","go test ./..."],"status":"failed","exit_code":1,"aggregated_output":"FAIL\tproj\n"}}}
 {"timestamp":"2026-06-26T21:32:02.0Z","type":"response_item","payload":{"type":"function_call_output","call_id":"call-1","output":"Process exited with code 1\nFAIL\tproj"}}
 {"timestamp":"2026-06-26T21:32:03.0Z","type":"event_msg","payload":{"type":"item_completed","item":{"type":"CommandExecution","id":"exec-2","command":["/bin/zsh","-lc","ls"],"status":"completed","exit_code":0,"aggregated_output":"tool output\n"}}}
+{"timestamp":"2026-06-26T21:32:04.0Z","type":"response_item","payload":{"type":"custom_tool_call","status":"completed","call_id":"call-2","name":"apply_patch","input":"*** Begin Patch\n*** End Patch\n"}}
+{"timestamp":"2026-06-26T21:32:04.1Z","type":"response_item","payload":{"type":"web_search_call","status":"completed","action":{"type":"search","query":"codex rollout"}}}
+{"timestamp":"2026-06-26T21:32:04.2Z","type":"response_item","payload":{"type":"tool_search_call","call_id":"call-3","status":"completed","execution":"client","arguments":{"query":"github issues","limit":8}}}
 {"timestamp":"2026-06-26T21:32:05.0Z","type":"response_item","payload":{"type":"reasoning","summary":[]}}
 {"timestamp":"2026-06-26T21:32:08.0Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"hi human"}]}}
 {"timestamp":"2026-06-26T21:32:10.0Z","type":"event_msg","payload":{"type":"context_compacted"}}
@@ -62,12 +66,16 @@ func TestReadThread(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// developer role, the AGENTS.md injection, function_call, its output, and
-	// reasoning are all dropped; the typed turns, the command that exited
-	// non-zero, and the compaction marker remain.
+	// developer role, the AGENTS.md injection, tool outputs, and reasoning are
+	// all dropped; the typed turns, the calls, the command that exited non-zero,
+	// and the compaction marker remain.
 	want := []struct{ kind, role, text string }{
 		{session.KindMessage, session.RoleUser, "hello codex"},
+		{session.KindToolCall, "", ""},
 		{session.KindFailure, session.RoleTool, "FAIL\tproj\nexit status 1"},
+		{session.KindToolCall, "", ""},
+		{session.KindToolCall, "", ""},
+		{session.KindToolCall, "", ""},
 		{session.KindMessage, session.RoleAssistant, "hi human"},
 		{session.KindCompact, "", ""},
 	}
@@ -80,8 +88,24 @@ func TestReadThread(t *testing.T) {
 			t.Errorf("entry %d = %+v, want %v", i, got, w)
 		}
 	}
-	if f := th.Entries[1]; f.Tool != "CommandExecution" || f.Input != `["/bin/zsh","-lc","go test ./..."]` {
+	if f := th.Entries[2]; f.Tool != "CommandExecution" || f.Input != `["/bin/zsh","-lc","go test ./..."]` {
 		t.Errorf("failure = %+v, want Tool CommandExecution with command argv", f)
+	}
+	// Each call keeps a name and its input as JSON, however Codex spelled it.
+	var calls []string
+	for _, e := range th.Entries {
+		if e.Kind == session.KindToolCall {
+			calls = append(calls, e.Tool+" "+e.Input)
+		}
+	}
+	wantCalls := []string{
+		`exec_command {"cmd":"go test ./...","workdir":"/home/u/src/proj"}`,
+		`apply_patch "*** Begin Patch\n*** End Patch\n"`,
+		`web_search_call {"type":"search","query":"codex rollout"}`,
+		`tool_search_call {"query":"github issues","limit":8}`,
+	}
+	if !slices.Equal(calls, wantCalls) {
+		t.Errorf("calls = %q, want %q", calls, wantCalls)
 	}
 	if strings.Contains(th.VisibleText(), "tool output") {
 		t.Errorf("successful command leaked into the timeline: %+v", th.Entries)

@@ -63,6 +63,9 @@ func htmlEntries(entries []session.Entry) []htmlEntry {
 			Time:  ts,
 			Text:  e.Text,
 		}
+		if e.Kind == session.KindToolCall {
+			out[i].Text = StripControl(e.InputText())
+		}
 	}
 	return out
 }
