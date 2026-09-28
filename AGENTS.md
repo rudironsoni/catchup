@@ -8,8 +8,8 @@
 - Discuss substantial growth with the maintainer before implementation. Propose shared frameworks and cross-provider redesigns separately from provider additions.
 - Report additions and deletions separately for runtime code, tests/fixtures, and docs. Unrelated deletions do not pay for new complexity.
 
-For changes exceeding 300 lines, apply the [complexity guide](https://github.com/wilbeibi/wilbeibi-skills/blob/main/skills/code-review/COMPLEXITY.md).
-Count additions plus deletions across the whole PR, including tests, fixtures, and docs.
+For changes adding more than 400 lines, apply the [complexity guide](https://github.com/wilbeibi/wilbeibi-skills/blob/main/skills/code-review/COMPLEXITY.md).
+Count added lines across the whole PR, including tests, fixtures, and docs.
 Reduce maintenance cost, not readability or required behavior.
 
 ## Preserve the existing boundaries
