@@ -1065,20 +1065,11 @@ func forkCommand(src session.Source, model string) (string, []string, error) {
 		// work inside ZCode itself or handing the transcript to a CLI agent.
 		return "", nil, fmt.Errorf("fork zcode: ZCode is a desktop app with no CLI to resume a session; continue inside ZCode, or fork into a CLI agent with `catchup fork zcode --into <agent>`")
 	case session.ProviderDeepSeek:
-		if src.Ref.SessionID == "" {
-			return "", nil, fmt.Errorf("fork deepseek: missing session id")
-		}
-		if model != "" {
-			// The dsh launcher has no model flag; the model lives in the
-			// profile's settings.yaml. Passing one through would only break
-			// the resume invocation.
-			return "", nil, fmt.Errorf("fork deepseek: dsh takes its model from profile settings, not a flag; edit the profile and re-run without --model")
-		}
-		// dsh's own resume example is `dsh --profile tui --resume <session>`;
-		// launcher flags come first, app flags after (checked against dsh
-		// --help on 2026-08-19). The profile set is per-install, so tui may
-		// not exist — dsh's own error then tells the user how to create it.
-		return "dsh", []string{"--profile", "tui", "--resume", src.Ref.SessionID}, nil
+		// dsh removed its terminal UI upstream on 2026-08-04, and none of the
+		// profiles 0.1.7-rc.2 ships (acp, web, headless, sdk, sdk-minimal)
+		// resumes a session interactively; headless --session-id runs one
+		// task and exits. Fork lives in the dsh web UI.
+		return "", nil, fmt.Errorf("fork deepseek: dsh has no terminal UI to resume a session in; use Fork in the dsh web UI, or fork into a CLI agent with `catchup fork deepseek --into <agent>`")
 	default:
 		return "", nil, fmt.Errorf("fork: unsupported agent %q", src.Ref.Provider)
 	}
