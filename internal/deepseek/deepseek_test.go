@@ -5,6 +5,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -49,6 +50,64 @@ var wantEntries = []session.Entry{
 	{Kind: session.KindMessage, Role: session.RoleAssistant, Text: "first part\nsecond part", Time: time.UnixMilli(1786871600300)},
 }
 
+// transcriptV3 is session-abc as dsh 0.1.5-rc.3 writes it at format version 3,
+// sanitized from a real native v3 log with the tail a reopen appends to a
+// migrated one. The system prompt travels as system/message rows, one replacing
+// another; none of it, nor the reopen's end-seed and model selection, is
+// conversation.
+const transcriptV3 = `{"type":"session","version":3,"id":"session-abc","createdAt":1786870675123,"cwd":"/home/u/src/xurl","isSeeded":false,"delegationDepth":0,"agentPreset":"standard"}
+{"type":"permission/preset","seq":0,"time":1786870675375,"data":{"preset":"workspace-write"}}
+{"type":"turn/start","seq":1,"time":1786871592619,"data":{"turn":1}}
+{"type":"step/start","seq":2,"time":1786871592687,"data":{"turn":1,"step":1}}
+{"type":"system/message","seq":3,"time":1786871592688,"data":{"turn":1,"step":1,"message":{"id":"s1","role":"system","source":{"kind":"plugin","plugin":"@deepseek-ai/dsh-system-prompt"},"content":[]}},"surfaceOp":"append"}
+{"type":"user/message","seq":4,"time":1786871592689,"data":{"content":[{"type":"text","text":"support dsh v3"}],"source":{"kind":"user","rpcId":"rpc-1","clientTimeZone":"America/Los_Angeles"},"role":"user","id":"u1"},"surfaceOp":"append"}
+{"type":"user/message","seq":5,"time":1786871592690,"data":{"content":[{"type":"text","text":"<system-reminder>AGENTS.md</system-reminder>"}],"source":{"kind":"agent-instructions","form":"instructions","baseline":true},"role":"user","id":"u2"},"surfaceOp":"append"}
+{"type":"system/message","seq":6,"time":1786871592691,"data":{"turn":1,"step":1,"message":{"id":"s2","role":"system","source":{"kind":"plugin","plugin":"@deepseek-ai/dsh-system-prompt"},"content":[{"type":"text","text":"You are an AI agent powered by DeepSeek Harness."}]}},"surfaceOp":{"op":"replace","startSeq":3,"endSeq":3},"sourceEventSeqs":[3]}
+{"type":"request/header","seq":7,"time":1786871592692,"data":{"header":{"config":{"provider":"deepseek-official","model":"deepseek-flash","reasoningEffort":"high","maxTokens":256000}}}}
+{"type":"session/title","seq":8,"time":1786871592693,"data":{"title":"dsh support v3","messageSeqs":[4],"source":{"kind":"fallback"}}}
+{"type":"assistant/message","seq":9,"time":1786871595652,"data":{"turn":1,"step":1,"message":{"role":"assistant","content":[{"type":"reasoning","text":"hidden"},{"type":"text","text":"From v3."}],"source":{"kind":"model","provider":"deepseek-official","model":"deepseek-flash"},"id":"a1"},"usage":{"inputTokens":10,"outputTokens":5,"totalTokens":15},"stream":[{"type":"chunk","time":1786871595000,"chunk":{"type":"block-start","index":0,"blockType":"reasoning"}}]},"surfaceOp":"append"}
+{"type":"step/end","seq":10,"time":1786871595653,"data":{"turn":1,"step":1}}
+{"type":"turn/end","seq":11,"time":1786871595654,"data":{"turn":1,"reason":{"kind":"completed"}}}
+{"type":"session/end-seed","seq":12,"time":1786957995654,"data":{}}
+{"type":"model/selection","seq":13,"time":1786957996000,"data":{"provider":"deepseek-official","model":"deepseek-flash","reasoningEffort":"high"}}
+`
+
+// transcriptV4 is a new session as dsh 0.1.7-rc.2 writes it at format version
+// 4, sanitized from a real headless run. The prompt's inbox copy, the system
+// prompt, the runtime-context and skill-catalog rows, the title request and the
+// session-log delivery watermarks are not conversation.
+const transcriptV4 = `{"type":"session","version":4,"id":"session-new","createdAt":1790566681407,"cwd":"/home/u/src/other","isSeeded":false,"delegationDepth":0}
+{"type":"permission/preset","seq":0,"time":1790566681421,"data":{"preset":"workspace-write"}}
+{"type":"sandbox/mode","seq":1,"time":1790566681423,"data":{"mode":"workspace-write"}}
+{"type":"approval/policy","seq":2,"time":1790566681423,"data":{"policy":"ask"}}
+{"type":"agent/inbox/spliced","seq":3,"time":1790566681427,"data":{"target":"next-turn","start":0,"inserted":[{"content":[{"type":"text","text":"say pong"}],"source":{"kind":"user"},"role":"user","id":"u1"}]}}
+{"type":"turn/start","seq":4,"time":1790566681428,"data":{"turn":1}}
+{"type":"agent/inbox/spliced","seq":5,"time":1790566681429,"data":{"target":"next-turn","start":0,"removedCount":1,"inserted":[]}}
+{"type":"step/start","seq":6,"time":1790566681535,"data":{"turn":1,"step":1}}
+{"type":"system/message","seq":7,"time":1790566681537,"data":{"turn":1,"step":1,"message":{"role":"system","content":[{"type":"text","text":"You are an AI agent powered by DeepSeek Harness."}],"source":{"kind":"system-prompt"},"id":"s1"}},"surfaceOp":"append"}
+{"type":"user/message","seq":8,"time":1790566681538,"data":{"content":[{"type":"text","text":"say pong"}],"source":{"kind":"user"},"role":"user","id":"u1"},"surfaceOp":"append"}
+{"type":"user/message","seq":9,"time":1790566681540,"data":{"content":[{"type":"text","text":"Current runtime context.\n\nApproval policy: ask."}],"source":{"kind":"runtime-context","form":"snapshot","sections":[{"name":"approval:policy","text":"Approval policy: ask."}]},"role":"user","id":"u2"},"surfaceOp":"append"}
+{"type":"user/message","seq":10,"time":1790566681541,"data":{"content":[{"type":"text","text":"<system-reminder>skills</system-reminder>"}],"source":{"kind":"skill-catalog","form":"catalog","entries":[{"name":"catchup","description":"Recovers a previous session."}]},"role":"user","id":"u3"},"surfaceOp":"append"}
+{"type":"request/header","seq":11,"time":1790566681543,"data":{"header":{"config":{"provider":"deepseek-official","model":"deepseek-flash","maxTokens":256000,"reasoningEffort":"high"},"adapterDefaults":{"reasoningEffort":true,"maxTokens":true},"tools":[{"name":"bash","description":"Execute a bash command.","parameters":{"type":"object","properties":{"command":{"type":"string"}},"required":["command"]}}]},"reason":"initial"}}
+{"type":"request/context","seq":12,"time":1790566681545,"data":{"provider":"deepseek-official","model":"deepseek-flash","contextWindow":1000000,"systemPromptUpdate":"in-history"}}
+{"type":"session/title","seq":13,"time":1790566681550,"data":{"title":"say pong","messageSeqs":[8],"source":{"kind":"fallback"}}}
+{"type":"session/title-llm-request","seq":14,"time":1790566681552,"data":{"titleProvider":"session-title-first-prompt-llm","messageSeqs":[8],"route":{"provider":"deepseek-official","model":"deepseek-flash"},"system":"Create a concise title.","messages":[{"content":[{"type":"text","text":"[{\"seq\":8,\"text\":\"say pong\"}]"}],"source":{"kind":"dsh-session-title-llm"},"role":"user","id":"t1"}],"maxTokens":64}}
+{"type":"session-log-deepseek/delivery-accepted","seq":15,"time":1790566682154,"data":{"sessionId":"session-new","sessionFormatVersion":4,"throughSeq":14}}
+{"type":"session-log-deepseek/delivery-accepted","seq":16,"time":1790566682182,"data":{"sessionId":"session-new","sessionFormatVersion":4,"throughSeq":14}}
+{"type":"session/title","seq":17,"time":1790566682481,"data":{"title":"pong reply request","messageSeqs":[8],"source":{"kind":"provider","provider":"session-title-first-prompt-llm","model":{"provider":"deepseek-official","model":"deepseek-flash"}}}}
+{"type":"assistant/message","seq":18,"time":1790566682620,"data":{"turn":1,"step":1,"message":{"role":"assistant","content":[{"type":"reasoning","text":""},{"type":"text","text":"pong"}],"source":{"kind":"model","provider":"deepseek-official","model":"deepseek-flash","replayState":{"response":{"kind":"deepseek-messages","version":1,"model":"deepseek-flash"},"blocks":[{"type":"reasoning","signature":"sig"},{"type":"text"}]}},"id":"a1"},"usage":{"inputTokens":6980,"outputTokens":3,"totalTokens":6983}},"surfaceOp":"append"}
+{"type":"step/end","seq":19,"time":1790566682624,"data":{"turn":1,"step":1}}
+{"type":"turn/end","seq":20,"time":1790566682629,"data":{"turn":1,"reason":{"kind":"completed"}}}
+`
+
+// subagent is a subagent's child session of session-abc: a directory of its
+// own, named by a bare UUID, with the header a real one carries.
+var subagent = strings.Replace(renameSession(transcript, subagentID, "/home/u/src/xurl"),
+	`"delegationDepth":0,"agentPreset":"standard"`,
+	`"parentSession":"session-abc","origin":"subagent","delegationDepth":1,"agentPreset":"code"`, 1)
+
+const subagentID = "0d1e2f3a-4b5c-4d6e-8f70-819203a4b5c6"
+
 // renameSession retargets a transcript copy at another id and cwd so two
 // fixtures can live in different munged directories.
 func renameSession(body, id, cwd string) string {
@@ -56,16 +115,16 @@ func renameSession(body, id, cwd string) string {
 	return strings.Replace(s, "/home/u/src/xurl", cwd, 1)
 }
 
-func writeSession(t *testing.T, root, munged, id, body string, compressed bool, mod time.Time) {
+// writeSession writes one file into a session directory, zstd-compressed when
+// its name says so.
+func writeSession(t *testing.T, root, munged, id, name, body string, mod time.Time) {
 	t.Helper()
 	dir := filepath.Join(root, "sessions", munged, id)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	name := "session.jsonl"
 	var buf []byte
-	if compressed {
-		name = "session.jsonl.zstd"
+	if strings.HasSuffix(name, ".zstd") {
 		var z bytes.Buffer
 		w, err := zstd.NewWriter(&z)
 		if err != nil {
@@ -114,7 +173,7 @@ func checkThread(t *testing.T, t2 session.Thread) {
 
 func TestReadDeepSeekSession(t *testing.T) {
 	root := t.TempDir()
-	writeSession(t, root, "--home-u-src-xurl--", "session-abc", transcript, false, time.Now())
+	writeSession(t, root, "--home-u-src-xurl--", "session-abc", "session.jsonl", transcript, time.Now())
 
 	p := New()
 	src, err := p.Resolve(context.Background(), session.Roots{DeepSeek: root}, "session-abc")
@@ -130,7 +189,7 @@ func TestReadDeepSeekSession(t *testing.T) {
 
 func TestReadDeepSeekSessionZstd(t *testing.T) {
 	root := t.TempDir()
-	writeSession(t, root, "--home-u-src-xurl--", "session-abc", transcript, true, time.Now())
+	writeSession(t, root, "--home-u-src-xurl--", "session-abc", "session.jsonl.zstd", transcript, time.Now())
 
 	p := New()
 	thread, err := p.Read(context.Background(), session.Source{
@@ -148,7 +207,7 @@ func TestReadTornTail(t *testing.T) {
 	// A crashed writer's last line is half-written; the parsed prefix must
 	// survive with a warning.
 	torn := transcript + `{"type":"turn/sta`
-	writeSession(t, root, "--home-u-src-xurl--", "session-abc", torn, false, time.Now())
+	writeSession(t, root, "--home-u-src-xurl--", "session-abc", "session.jsonl", torn, time.Now())
 
 	p := New()
 	thread, err := p.Read(context.Background(), session.Source{
@@ -169,8 +228,9 @@ func TestReadTornTail(t *testing.T) {
 func TestResolveNewestAndByID(t *testing.T) {
 	root := t.TempDir()
 	old := renameSession(transcript, "session-old", "/home/u/src/other")
-	writeSession(t, root, "--home-u-src-other--", "session-old", old, false, time.Now().Add(-2*time.Hour))
-	writeSession(t, root, "--home-u-src-xurl--", "session-abc", transcript, false, time.Now())
+	writeSession(t, root, "--home-u-src-other--", "session-old", "session.jsonl", old, time.Now().Add(-2*time.Hour))
+	writeSession(t, root, "--home-u-src-xurl--", "session-abc", "session.jsonl", transcript, time.Now())
+	writeSession(t, root, "--home-u-src-xurl--", subagentID, "session.jsonl", subagent, time.Now().Add(time.Hour))
 
 	p := New()
 	src, err := p.Resolve(context.Background(), session.Roots{DeepSeek: root}, "")
@@ -178,7 +238,15 @@ func TestResolveNewestAndByID(t *testing.T) {
 		t.Fatal(err)
 	}
 	if src.Ref.SessionID != "session-abc" {
-		t.Fatalf("newest = %q, want session-abc", src.Ref.SessionID)
+		t.Fatalf("newest = %q, want session-abc, never a subagent", src.Ref.SessionID)
+	}
+
+	src, err = p.Resolve(context.Background(), session.Roots{DeepSeek: root}, subagentID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if src.Ref.SessionID != subagentID || src.Metadata["parent"] != "session-abc" {
+		t.Fatalf("subagent by id = %q, metadata %+v", src.Ref.SessionID, src.Metadata)
 	}
 
 	src, err = p.Resolve(context.Background(), session.Roots{DeepSeek: root}, "session-old")
@@ -196,8 +264,10 @@ func TestResolveNewestAndByID(t *testing.T) {
 
 func TestListFilters(t *testing.T) {
 	root := t.TempDir()
-	writeSession(t, root, "--home-u-src-xurl--", "session-abc", transcript, false, time.Now())
-	writeSession(t, root, "--home-u-src-other--", "session-old", renameSession(transcript, "session-old", "/home/u/src/other"), false, time.Now().Add(-2*time.Hour))
+	writeSession(t, root, "--home-u-src-xurl--", "session-abc", "session.jsonl", transcript, time.Now())
+	old := renameSession(transcript, "session-old", "/home/u/src/other")
+	writeSession(t, root, "--home-u-src-other--", "session-old", "session.jsonl", old, time.Now().Add(-2*time.Hour))
+	writeSession(t, root, "--home-u-src-xurl--", subagentID, "session.jsonl", subagent, time.Now().Add(-time.Hour))
 
 	p := New()
 	sums, err := p.List(context.Background(), session.Roots{DeepSeek: root}, session.ListOptions{})
@@ -236,6 +306,62 @@ func TestListFilters(t *testing.T) {
 	}
 }
 
+// TestMigratedSession reads session directories as dsh leaves them. Migrating
+// session-abc wrote its version 3 log beside the untouched version 0 one, next
+// to the lease and a manual backup; session-new began at version 4.
+func TestMigratedSession(t *testing.T) {
+	root := t.TempDir()
+	mod := time.Now().Add(-time.Hour).Truncate(time.Second)
+	writeSession(t, root, "--home-u-src-xurl--", "session-abc", "session.jsonl.zstd", transcript, mod.Add(-24*time.Hour))
+	writeSession(t, root, "--home-u-src-xurl--", "session-abc", "session.v3.jsonl.zstd", transcriptV3, mod)
+	writeSession(t, root, "--home-u-src-xurl--", "session-abc", "session.lock", "", time.Now())
+	writeSession(t, root, "--home-u-src-xurl--", "session-abc", "session.jsonl.zstd.bak-x", transcript, time.Now())
+	newMod := mod.Add(-time.Hour)
+	writeSession(t, root, "--home-u-src-other--", "session-new", "session.v4.jsonl.zstd", transcriptV4, newMod)
+
+	p := New()
+	src, err := p.Resolve(context.Background(), session.Roots{DeepSeek: root}, "session-abc")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if filepath.Base(src.Path) != "session.v3.jsonl.zstd" || !src.UpdatedAt.Equal(mod) {
+		t.Fatalf("source = %s at %v, want the version 3 log at %v", src.Path, src.UpdatedAt, mod)
+	}
+	thread, err := p.Read(context.Background(), src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []session.Entry{
+		{Kind: session.KindMessage, Role: session.RoleUser, Text: "support dsh v3", Time: time.UnixMilli(1786871592689)},
+		{Kind: session.KindMessage, Role: session.RoleAssistant, Text: "From v3.", Time: time.UnixMilli(1786871595652)},
+	}
+	if !slices.Equal(thread.Entries, want) || len(thread.Warnings) != 0 {
+		t.Fatalf("entries = %+v, warnings = %q", thread.Entries, thread.Warnings)
+	}
+
+	if src, err = p.Resolve(context.Background(), session.Roots{DeepSeek: root}, "session-new"); err != nil {
+		t.Fatal(err)
+	}
+	if thread, err = p.Read(context.Background(), src); err != nil {
+		t.Fatal(err)
+	}
+	want = []session.Entry{
+		{Kind: session.KindMessage, Role: session.RoleUser, Text: "say pong", Time: time.UnixMilli(1790566681538)},
+		{Kind: session.KindMessage, Role: session.RoleAssistant, Text: "pong", Time: time.UnixMilli(1790566682620)},
+	}
+	if !slices.Equal(thread.Entries, want) || len(thread.Warnings) != 0 {
+		t.Fatalf("version 4 entries = %+v, warnings = %q", thread.Entries, thread.Warnings)
+	}
+
+	sums, err := p.List(context.Background(), session.Roots{DeepSeek: root}, session.ListOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(sums) != 2 || sums[0].Ref.SessionID != "session-abc" || sums[1].Ref.SessionID != "session-new" {
+		t.Fatalf("listing = %+v, want each session once", sums)
+	}
+}
+
 func TestEmptyRoot(t *testing.T) {
 	p := New()
 	if _, err := p.Resolve(context.Background(), session.Roots{DeepSeek: t.TempDir()}, ""); err == nil {
@@ -257,7 +383,8 @@ func TestTitleFallsBackToCwdBase(t *testing.T) {
 		}
 		lines = append(lines, l)
 	}
-	writeSession(t, root, "--home-u-src-xurl--", "session-abc", strings.Join(lines, "\n")+"\n", false, time.Now())
+	body := strings.Join(lines, "\n") + "\n"
+	writeSession(t, root, "--home-u-src-xurl--", "session-abc", "session.jsonl", body, time.Now())
 
 	p := New()
 	src, err := p.Resolve(context.Background(), session.Roots{DeepSeek: root}, "")

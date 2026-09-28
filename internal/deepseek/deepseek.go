@@ -2,32 +2,47 @@
 // history: per-session JSONL logs under $DSH_HOME/sessions (default
 // ~/.dsh/sessions).
 //
-// Format reference, derived from the dsh session docs and a live install
-// (github.com/deepseek-ai/deepseek-harness, docs/subsystems/session.md):
+// Format reference, derived from the dsh session docs, the dsh 0.1.7-rc.2
+// packages that write and migrate the logs (@deepseek-ai/dsh-session-format,
+// dsh-session-persistence-jsonl, dsh-session-format-v2-to-v3 and -v3-to-v4,
+// dsh-subagent), and live installs:
 //
-//	sessions/<munged-cwd>/session-<uuid>/session.jsonl.zstd holds one session;
-//	the munged-cwd directory name replaces each "/" of the session's working
-//	directory with "-" (the same shape Codex rollouts use). The physical
-//	encoding is zstd-compressed JSONL by default; installs that configure
-//	compression off write plain session.jsonl instead. Both are read here.
+//	sessions/--<project>--/<id>/ holds one session; the project directory is a
+//	lossy encoding of the working directory, so the header's cwd is used
+//	instead. The log is zstd-compressed JSONL by default, one frame per append
+//	batch; installs that configure compression off write plain JSONL instead.
+//	Both are read here.
+//
+//	Each format version has its own file: session.jsonl[.zstd] is version 0,
+//	session.vN.jsonl[.zstd] version N. Writing to an older session first
+//	migrates it to the current version (4 as of 0.1.7-rc.2) in a new file and
+//	leaves the old one untouched, so the highest version is the live log. The
+//	session.lock lease, migration staging files and manual backups beside it
+//	are not logs.
 //
 // The first line is a session header {"type":"session","version","id","cwd",
 // "createdAt","agentPreset"}; every later line is one append-only event
-// {type, seq, time, data} with epoch-ms times and contiguous seq. Packed
-// chunk runs are stored as single rows (text-chunks/reasoning-chunks with
-// seq0 instead of seq); they carry no timeline content and are skipped along
-// with every other non-message event. A crashed writer can leave a torn final
-// line; reading stops there and keeps the parsed prefix.
+// {type, seq, time, data} with epoch-ms times and contiguous seq. Versions 0
+// and 1 store packed chunk runs as single rows (text-chunks/reasoning-chunks
+// with seq0 instead of seq); they carry no timeline content and are skipped
+// along with every other non-message event. A crashed writer can leave a torn
+// final line; reading stops there and keeps the parsed prefix.
+//
+// A subagent's child session is a session of its own whose header adds origin
+// "subagent" and its parentSession. dsh's session list hides it, and so do List
+// and Resolve without an id; Resolve by id still finds it. A user's fork also
+// records a parentSession, but no origin, so it stays listed.
 //
 // Visible on the timeline: user/message events whose data.source.kind is
-// "user" (plugin- and skill-catalog-sourced user rows are injected runtime
-// context — sandbox snapshots, skill catalogs, tool modes — not conversation,
-// and a live session is dominated by them) and assistant/message text blocks
-// (reasoning blocks are skipped). Compaction seam events (type prefixed
-// "compaction/") become compaction markers. Metadata: the header's id and
-// cwd; session/title events, last writer wins; request/header's
-// data.header.config {provider,model} plus each assistant message's
-// data.message.source {provider,model}.
+// "user" (other kinds are injected context, not conversation: runtime-context
+// sandbox snapshots, skill catalogs, agent instructions, tool modes, and before
+// version 4 anything a plugin sourced; a live session is dominated by them)
+// and assistant/message text blocks (reasoning blocks are skipped). Tool
+// results are tool/result events, never user/message. Compaction seam events
+// (type prefixed "compaction/") become compaction markers. Metadata: the
+// header's id and cwd; session/title events, last writer wins;
+// request/header's data.header.config {provider,model} plus each assistant
+// message's data.message.source {provider,model}.
 //
 // Unverified: no local install had run compaction, so the compaction/* shapes
 // and the replacement user/message rows the compaction plugins append (a
@@ -44,7 +59,9 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -78,7 +95,12 @@ func (p *Provider) Resolve(ctx context.Context, roots session.Roots, id string) 
 		}
 		return session.Source{}, fmt.Errorf("deepseek: no session with id %q", id)
 	}
-	return readMeta(files[0])
+	for _, fi := range files {
+		if src, err := readMeta(fi); err != nil || !isSubagent(src) {
+			return src, err
+		}
+	}
+	return session.Source{}, fmt.Errorf("deepseek: no sessions found under %s", roots.DeepSeek)
 }
 
 func (p *Provider) Read(ctx context.Context, src session.Source) (session.Thread, error) {
@@ -104,7 +126,7 @@ func (p *Provider) List(ctx context.Context, roots session.Roots, opts session.L
 			break
 		}
 		t, err := readThread(fi)
-		if err != nil || len(t.Entries) == 0 {
+		if err != nil || len(t.Entries) == 0 || isSubagent(t.Source) {
 			continue
 		}
 		if !opts.Matches(t) {
@@ -121,39 +143,66 @@ func (p *Provider) List(ctx context.Context, roots session.Roots, opts session.L
 // --- file enumeration -------------------------------------------------------
 
 type fileInfo struct {
-	path string
-	mod  time.Time
-	id   string
+	path    string
+	mod     time.Time
+	id      string
+	version int
 }
 
-// sessionFiles returns every dsh session log under <root>/sessions, newest
-// first. The walk matches session.jsonl and session.jsonl.zstd by name rather
-// than hard-coding the two directory levels, so a future nesting change costs
-// nothing. The session id is its directory's base name.
+// logName is dsh's canonical generation name (CANONICAL_LOG_FILENAME) under
+// either compression suffix: session.jsonl is version 0, session.vN.jsonl
+// version N. Lock files, migration staging and manual backups never match.
+var logName = regexp.MustCompile(`^session(?:\.v([1-9][0-9]*))?\.jsonl(?:\.zstd)?$`)
+
+// sessionFiles returns one log per dsh session under <root>/sessions, newest
+// first. A migration leaves the older generation beside the new one, so each
+// session directory yields only its highest version, the one dsh reads and
+// appends to. The walk matches file names rather than hard-coding the two
+// directory levels, so a future nesting change costs nothing. The session id is
+// its directory's base name.
 func sessionFiles(root string) ([]fileInfo, error) {
 	dir := filepath.Join(root, "sessions")
 	if _, err := os.Stat(dir); errors.Is(err, fs.ErrNotExist) {
 		return nil, nil
 	}
 	var files []fileInfo
+	seen := map[string]int{} // session directory -> its index in files
 	err := filepath.WalkDir(dir, func(p string, d fs.DirEntry, err error) error {
 		if err != nil || d.IsDir() {
 			return nil
 		}
-		if base := d.Name(); base != "session.jsonl" && base != "session.jsonl.zstd" {
+		m := logName.FindStringSubmatch(d.Name())
+		if m == nil {
 			return nil
 		}
-		if info, e := d.Info(); e == nil {
-			files = append(files, fileInfo{
-				path: p,
-				mod:  info.ModTime(),
-				id:   filepath.Base(filepath.Dir(p)),
-			})
+		version, _ := strconv.Atoi(m[1]) // v0's name has no number: 0
+		sessionDir := filepath.Dir(p)
+		i, ok := seen[sessionDir]
+		if ok && files[i].version >= version {
+			return nil
+		}
+		info, e := d.Info()
+		if e != nil {
+			return nil
+		}
+		fi := fileInfo{path: p, mod: info.ModTime(), id: filepath.Base(sessionDir), version: version}
+		if ok {
+			files[i] = fi
+		} else {
+			seen[sessionDir] = len(files)
+			files = append(files, fi)
 		}
 		return nil
 	})
 	sort.Slice(files, func(i, j int) bool { return files[i].mod.After(files[j].mod) })
 	return files, err
+}
+
+// isSubagent reports a subagent's child session, which dsh's own session list
+// hides: its header's origin is "subagent". A parentSession alone does not
+// mark one, since a user's fork of a session records its parent too.
+func isSubagent(src session.Source) bool {
+	return src.Metadata["relationship"] == "child"
 }
 
 // readMeta delegates instead of doing a metadata-only scan: dsh keeps the
@@ -179,6 +228,10 @@ type dshLine struct {
 	Time      int64           `json:"time"`
 	SurfaceOp json.RawMessage `json:"surfaceOp"`
 	Data      json.RawMessage `json:"data"`
+
+	// Session header only, set on a subagent's child session.
+	Origin        string `json:"origin"`
+	ParentSession string `json:"parentSession"`
 }
 
 // Per-event data shapes; decode tolerance is applyLine's contract.
@@ -247,6 +300,9 @@ func readThread(fi fileInfo) (session.Thread, error) {
 				}
 				if line.Cwd != "" {
 					src.Metadata["cwd"] = line.Cwd
+				}
+				if line.Origin == "subagent" {
+					src.Metadata["parent"], src.Metadata["relationship"] = line.ParentSession, "child"
 				}
 				continue
 			}
@@ -333,25 +389,38 @@ func applyLine(src *session.Source, entries *[]session.Entry, unknown *session.U
 	}
 }
 
-// dshIgnored names every other event dsh writes: the streamed halves of the
-// messages already read, the tools and commands the agent ran, the turn and
-// step frames around them, the session's own settings and approvals, and the
-// model requests the CLI makes for itself. Nothing here is conversation, and
-// naming them is what lets an event dsh grows later announce itself.
+// dshIgnored names every other event dsh writes: the 0.1.7-rc.2 vocabulary
+// (KNOWN_SESSION_EVENT_TYPES) and the rows only older logs hold. None of it is
+// conversation: the system prompt and developer notices, the streamed halves
+// of the messages already read, the tools, hooks and commands the agent ran
+// and the files they touched, the turn and step frames around them, the
+// session's own settings, approvals, feedback and plugin state, and the model
+// requests and log uploads the CLI makes for itself. Naming them is what lets
+// an event dsh grows later announce itself.
 var dshIgnored = map[string]bool{
 	"assistant/chunk": true, "text-chunks": true, "reasoning-chunks": true, "tool-call-chunks": true,
+	"assistant/attempt": true, "system/message": true, "developer/message": true,
 
 	"tool/call": true, "tool/result": true, "tool/code-dispatch": true,
-	"tool/code-dispatch-start": true, "command/run": true, "command/done": true, "todo/write": true,
+	"tool/code-dispatch-start": true, "tool/ptc-dispatch": true, "tool/ptc-dispatch-start": true,
+	"tool-workflow/run-start": true, "tool-workflow/run-end": true,
+	"tool-workflow/agent-start": true, "tool-workflow/agent-end": true,
+	"command/run": true, "command/done": true, "todo/write": true, "hook/invoked": true, "hook/result": true,
+	"image/offload": true, "workspace/changes": true, "deliverables/presented": true,
 
 	"turn/start": true, "turn/end": true, "step/start": true, "step/end": true,
 
 	"session": true, "session/end-seed": true, "sandbox/mode": true, "approval/policy": true,
-	"approval/asked": true, "approval/decided": true, "permission/preset": true,
+	"approval/asked": true, "approval/decided": true, "permission/preset": true, "model/selection": true,
 	"agent-preset/selected": true, "subagent/descriptor": true, "agent/inbox/spliced": true,
+	"subagent/catalog": true, "subagent/model-selection-policy": true, "plan/mode": true,
+	"goal/change": true, "schedule/change": true, "team/member": true, "team/task": true,
+	"team/message/queued": true, "team/message/delivered": true,
+	"feedback/record": true, "feedback/message-put": true, "feedback/message-delete": true,
 
 	"request/context": true, "llm/retry": true, "llm/retry-started": true,
 	"session/title-llm-request": true, "web/deepseek-search-llm-request": true,
+	"session-log-deepseek/delivery-accepted": true,
 }
 
 // isAppend reports whether an event joined the surface as a plain append.
