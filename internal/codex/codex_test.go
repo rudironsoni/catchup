@@ -136,6 +136,7 @@ func TestIsInjectedUserText(t *testing.T) {
 		"# AGENTS.md instructions for /home/u/src/proj\n\n<INSTRUCTIONS>\nbe nice\n</INSTRUCTIONS>",
 		"<system-reminder>context</system-reminder>",
 		"<environment_context>cwd</environment_context>\n<skill>a skill</skill>",
+		"<turn_aborted>\nThe user interrupted the previous turn on purpose.\n</turn_aborted>",
 	}
 	for _, s := range injected {
 		if !isInjectedUserText(s) {
@@ -168,6 +169,7 @@ const rolloutCompacted = `{"timestamp":"2026-07-26T21:00:00.0Z","type":"session_
 {"timestamp":"2026-07-26T21:04:00.0Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"second answer"}]}}
 {"timestamp":"2026-07-26T21:05:00.0Z","type":"compacted","payload":{"message":"","replacement_history":[{"type":"message","role":"developer","content":[{"type":"input_text","text":"<permissions>"}]},{"type":"message","role":"user","content":[{"type":"input_text","text":"# AGENTS.md instructions for /home/u/src/proj\n\n<INSTRUCTIONS>\nbe nice\n</INSTRUCTIONS>"}]},{"type":"message","role":"user","content":[{"type":"input_text","text":"second question"}]},{"type":"compaction","encrypted_content":"opaque"}]}}
 {"timestamp":"2026-07-26T21:05:01.0Z","type":"turn_context","payload":{"cwd":"/home/u/src/proj"}}
+{"timestamp":"2026-07-26T21:05:01.5Z","type":"token_usage_record","payload":{"thread_id":"sess-2","turn_id":"turn-1","usage":{"input_tokens":1,"output_tokens":1}}}
 {"timestamp":"2026-07-26T21:05:02.0Z","type":"event_msg","payload":{"type":"context_compacted"}}
 {"timestamp":"2026-07-26T21:06:00.0Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"third question"}]}}
 {"timestamp":"2026-07-26T21:07:00.0Z","type":"compacted","payload":{"message":"","replacement_history":[{"type":"message","role":"user","content":[{"type":"input_text","text":"third question"}]}]}}
@@ -223,7 +225,7 @@ func TestReadCompaction(t *testing.T) {
 
 	if len(th.Warnings) != 1 || !strings.Contains(th.Warnings[0], "telemetry_probe") ||
 		!strings.Contains(th.Warnings[0], "response_item/chat_message") ||
-		!strings.Contains(th.Warnings[0], "event_msg/user_post") {
+		!strings.Contains(th.Warnings[0], "event_msg/user_post") || strings.Contains(th.Warnings[0], "token_usage_record") {
 		t.Errorf("warnings = %q, want one naming the unrecognized outer and nested record types", th.Warnings)
 	}
 }

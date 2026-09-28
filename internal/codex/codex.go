@@ -353,8 +353,8 @@ func readThread(fi fileInfo) (session.Thread, error) {
 				unknown.Add("event_msg/" + ptype)
 			}
 
-		case "turn_context", "world_state", "inter_agent_communication_metadata":
-			// Per-turn settings, the workspace snapshot, and sub-agent routing:
+		case "turn_context", "world_state", "inter_agent_communication_metadata", "token_usage_record":
+			// Per-turn settings, the workspace snapshot, sub-agent routing, and token accounting:
 			// written beside the conversation, never part of it.
 
 		default:
@@ -554,9 +554,10 @@ func joinContent(m codexMessage) string {
 	return strings.Join(parts, "\n")
 }
 
-// injectionTags wrap the environment and project context Codex feeds in as
-// user turns.
-var injectionTags = []string{"INSTRUCTIONS", "skill", "user_instructions", "environment_context", "system-reminder", "recommended_plugins"}
+// injectionTags wrap the environment, project context, and interrupt notices
+// Codex feeds in as user turns.
+var injectionTags = []string{"INSTRUCTIONS", "skill", "user_instructions", "environment_context", "system-reminder",
+	"recommended_plugins", "turn_aborted"}
 
 // isInjectedUserText reports whether a user message is environment/context that
 // Codex injects as a user turn rather than something the person typed: the
